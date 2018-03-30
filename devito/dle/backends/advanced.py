@@ -18,12 +18,10 @@ from devito.dse import promote_scalar_expressions
 from devito.exceptions import DLEException
 from devito.ir.iet import (Block, Expression, Iteration, List,
                            PARALLEL, ELEMENTAL, REMAINDER, tagger,
-                           FindNodes, FindSymbols, IsPerfectIteration,
-                           SubstituteExpression, Transformer, compose_nodes,
-                           retrieve_iteration_tree, filter_iterations, copy_arrays)
+                           FindSymbols, IsPerfectIteration, Transformer,
+                           compose_nodes, retrieve_iteration_tree, filter_iterations)
 from devito.logger import dle_warning
-from devito.tools import as_tuple, grouper, roundm
-from devito.types import Array
+from devito.tools import as_tuple, grouper
 
 
 class DevitoRewriter(BasicRewriter):
@@ -157,30 +155,26 @@ class DevitoRewriter(BasicRewriter):
                 name = "%s%d_block" % (i.dim.name, len(mapper))
 
                 # Build Iteration over blocks
-                dim = blocked.setdefault(i, Dimension(name))
-                block_size = dim.symbolic_size
-                iter_size = i.dim.symbolic_extent
-                start = i.limits[0] - i.offsets[0]
-                finish = i.dim.symbolic_end - i.offsets[1]
-                innersize = iter_size - (-i.offsets[0] + i.offsets[1])
-                finish = finish - (innersize % block_size)
-                inter_block = Iteration([], dim, [start, finish, block_size],
-                                        properties=PARALLEL)
+                dim = blocked.setdefault(i, Dimension(name=name))
+                bsize = dim.symbolic_size
+                bstart = i.limits[0]
+                binnersize = i.dim.symbolic_extent + (i.offsets[1] - i.offsets[0])
+                bfinish = i.dim.symbolic_end - (binnersize % bsize) - 1
+                inter_block = Iteration([], dim, [bstart, bfinish, bsize],
+                                        offsets=i.offsets, properties=PARALLEL)
                 inter_blocks.append(inter_block)
 
                 # Build Iteration within a block
-                start = inter_block.dim
-                finish = start + block_size
-                intra_block = i._rebuild([], limits=[start, finish, 1], offsets=None,
+                limits = (dim, dim + bsize - 1, 1)
+                intra_block = i._rebuild([], limits=limits, offsets=(0, 0),
                                          properties=i.properties + (TAG, ELEMENTAL))
                 intra_blocks.append(intra_block)
 
                 # Build unitary-increment Iteration over the 'leftover' region.
                 # This will be used for remainder loops, executed when any
                 # dimension size is not a multiple of the block size.
-                start = inter_block.limits[1]
-                finish = i.dim.symbolic_end - i.offsets[1]
-                remainder = i._rebuild([], limits=[start, finish, 1], offsets=None)
+                remainder = i._rebuild([], limits=[bfinish + 1, i.dim.symbolic_end, 1],
+                                       offsets=(i.offsets[1], i.offsets[1]))
                 remainders.append(remainder)
 
             # Build blocked Iteration nest
@@ -336,6 +330,9 @@ class DevitoRewriter(BasicRewriter):
         Reshape temporary tensors and adjust loop trip counts to prevent as many
         compiler-generated remainder loops as possible.
         """
+        # The innermost dimension is the one that might get padded
+        p_dim = -1
+
         mapper = {}
         for tree in retrieve_iteration_tree(nodes):
             vector_iterations = [i for i in tree if i.is_Vectorizable]
@@ -359,7 +356,8 @@ class DevitoRewriter(BasicRewriter):
             if len(set(padding)) == 1:
                 padding = padding[0]
                 for i in writes:
-                    i.update(shape=i.shape[:-1] + (i.shape[-1] + padding,))
+                    padded = (i._padding[p_dim][0], i._padding[p_dim][1] + padding)
+                    i.update(padding=i._padding[:p_dim] + (padded,))
             else:
                 # Padding must be uniform -- not the case, so giving up
                 continue
@@ -369,12 +367,13 @@ class DevitoRewriter(BasicRewriter):
             if not endpoint.is_Symbol:
                 continue
             condition = []
-            externals = set(i.symbolic_shape[-1] for i in FindSymbols().visit(root))
+            externals = set(i.symbolic_shape[-1] for i in FindSymbols().visit(root)
+                            if i.is_Tensor)
             for i in root.uindices:
                 for j in externals:
                     condition.append(root.end_symbolic + padding < j)
-            condition = ' || '.join(ccode(i) for i in condition)
-            endpoint_padded = endpoint.func(name='_%s' % endpoint.name)
+            condition = ' && '.join(ccode(i) for i in condition)
+            endpoint_padded = endpoint.func('_%s' % endpoint.name)
             init = cgen.Initializer(
                 cgen.Value("const int", endpoint_padded),
                 cgen.Line('(%s) ? %s : %s' % (condition,
@@ -417,7 +416,6 @@ class DevitoSpeculativeRewriter(DevitoRewriter):
     def _pipeline(self, state):
         self._avoid_denormals(state)
         self._loop_fission(state)
-        self._padding(state)
         self._loop_blocking(state)
         self._simdize(state)
         self._nontemporal_stores(state)
@@ -425,61 +423,6 @@ class DevitoSpeculativeRewriter(DevitoRewriter):
             self._ompize(state)
         self._create_elemental_functions(state)
         self._minimize_remainders(state)
-
-    @dle_pass
-    def _padding(self, nodes, state):
-        """
-        Introduce temporary buffers padded to the nearest multiple of the vector
-        length, to maximize data alignment. At the bottom of the kernel, the
-        values in the padded temporaries will be copied back into the input arrays.
-        """
-        mapper = OrderedDict()
-
-        # Assess feasibility of the transformation
-        handle = FindSymbols('symbolics-writes').visit(nodes)
-        if not handle:
-            return nodes, {}
-        shape = max([i.shape for i in handle], key=len)
-        if not shape:
-            return nodes, {}
-        candidates = [i for i in handle if i.shape[-1] == shape[-1]]
-        if not candidates:
-            return nodes, {}
-
-        # Retrieve the maximum number of items in a SIMD register when processing
-        # the expressions in /node/
-        exprs = FindNodes(Expression).visit(nodes)
-        exprs = [e for e in exprs if e.write in candidates]
-        assert len(exprs) > 0
-        dtype = exprs[0].dtype
-        assert all(e.dtype == dtype for e in exprs)
-        try:
-            simd_items = get_simd_items(dtype)
-        except KeyError:
-            # Fallback to 16 (maximum expectable padding, for AVX512 registers)
-            simd_items = simdinfo['avx512f'] / np.dtype(dtype).itemsize
-
-        shapes = {k: k.shape[:-1] + (roundm(k.shape[-1], simd_items),)
-                  for k in candidates}
-        mapper.update(OrderedDict([(k.indexed,
-                                    Array(name='p%s' % k.name,
-                                          shape=shapes[k],
-                                          dimensions=k.indices,
-                                          onstack=k._mem_stack).indexed)
-                      for k in candidates]))
-
-        # Substitute original arrays with padded buffers
-        processed = SubstituteExpression(mapper).visit(nodes)
-
-        # Build Iteration trees for initialization and copy-back of padded arrays
-        mapper = OrderedDict([(k, v) for k, v in mapper.items()
-                              if k.function.is_SymbolicFunction])
-        init = copy_arrays(mapper, reverse=True)
-        copyback = copy_arrays(mapper)
-
-        processed = List(body=init + as_tuple(processed) + copyback)
-
-        return processed, {}
 
     @dle_pass
     def _nontemporal_stores(self, nodes, state):
@@ -518,7 +461,6 @@ class DevitoCustomRewriter(DevitoSpeculativeRewriter):
         'openmp': DevitoSpeculativeRewriter._ompize,
         'simd': DevitoSpeculativeRewriter._simdize,
         'fission': DevitoSpeculativeRewriter._loop_fission,
-        'padding': DevitoSpeculativeRewriter._padding,
         'split': DevitoSpeculativeRewriter._create_elemental_functions
     }
 

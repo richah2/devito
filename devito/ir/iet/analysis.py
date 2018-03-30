@@ -11,9 +11,9 @@ from functools import cmp_to_key
 from devito.ir.iet import (Iteration, SEQUENTIAL, PARALLEL, VECTOR, WRAPPABLE,
                            MapIteration, NestedTransformer, retrieve_iteration_tree)
 from devito.ir.support import Scope
-from devito.tools import as_tuple
+from devito.tools import as_tuple, filter_ordered, flatten
 
-__all__ = ['analyze_iterations']
+__all__ = ['iet_analyze']
 
 
 class Analysis(object):
@@ -39,7 +39,7 @@ def propertizer(func):
     return wrapper
 
 
-def analyze_iterations(iet):
+def iet_analyze(iet):
     """
     Attach :class:`IterationProperty` to :class:`Iteration` objects within
     ``nodes``. The recognized IterationProperty decorators are listed in
@@ -69,14 +69,21 @@ def mark_parallel(analysis):
         for depth, i in enumerate(tree):
             if i in properties:
                 continue
-            dims = [j.dim for j in tree[:depth + 1]]
+            # Get all dimensions up to and including Iteration /i/, grouped by Iteration
+            dims = [filter_ordered([j.dim] + [k.dim for k in j.uindices])
+                    for j in tree[:depth + 1]]
+            # Get all dimensions up to and including Iteration /i-1/
+            prev = flatten(dims[:-1])
+            # Get all dimensions up to and including Iteration /i/
+            dims = flatten(dims)
             # The i-th Iteration is PARALLEL if for all dependences (d_1, ..., d_n):
             # (d_1, ..., d_{i-1}) > 0, OR
             # (d_1, ..., d_i) = 0
             is_sequential = False
             for dep in analysis.scopes[i].d_all:
-                if not ((dims[:-1] and any(dep.is_carried(d) for d in dims[:-1])) or
-                        all(dep.is_independent(d) for d in dims)):
+                test0 = len(prev) > 0 and any(dep.is_carried(d) for d in prev)
+                test1 = all(dep.is_independent(d) for d in dims)
+                if not (test0 or test1):
                     is_sequential = True
                     break
             properties[i] = SEQUENTIAL if is_sequential else PARALLEL
@@ -136,19 +143,16 @@ def mark_wrappable(analysis):
         return
     # Finally check that all data dependences would be honored by using the
     # /front/ index function in place of the /back/ index function
-    for tree in analysis.trees:
-        for i in tree:
-            if i == stepper:
-                continue
-            # There must be NO writes to the /back/ timeslot
-            for access in analysis.scopes[i].accesses:
-                if access.is_write and access[stepping] == back:
-                    return
-            # All reads from the /front/ timeslot must not cause dependences with
-            # the writes in the /back/ timeslot along the /i/ dimension
-            for dep in analysis.scopes[i].d_flow:
-                if dep.source[stepping] != front or dep.sink[stepping] != back:
-                    continue
-                if dep.source.section(stepping) != dep.sink.section(stepping):
-                    return
+    # There must be NO writes to the /back/ timeslot
+    for access in analysis.scopes[stepper].accesses:
+        if access.is_write and access[stepping] == back:
+            return
+    # All reads from the /front/ timeslot must not cause dependences with
+    # the writes in the /back/ timeslot along the /i/ dimension
+    for dep in analysis.scopes[stepper].d_flow:
+        if dep.source[stepping] != front or dep.sink[stepping] != back:
+            continue
+        if dep.sink.lex_gt(dep.source) and\
+                dep.source.section(stepping) != dep.sink.section(stepping):
+            return
     analysis.update({stepper: WRAPPABLE})

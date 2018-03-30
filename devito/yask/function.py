@@ -1,14 +1,16 @@
-import devito.types as types
-import devito.function as function
+from cached_property import cached_property
+import ctypes
+import numpy as np
 
-from devito.yask.wrappers import YaskGridConst, contexts
+import devito.function as function
+from devito.logger import yask as log
+from devito.tools import numpy_to_ctypes
+
+from devito.yask import namespace
+from devito.yask.data import Data, DataScalar
+from devito.yask.wrappers import contexts
 
 __all__ = ['Constant', 'Function', 'TimeFunction']
-
-
-types.Basic.from_YASK = False
-
-types.Array.from_YASK = True
 
 
 class Constant(function.Constant):
@@ -17,44 +19,76 @@ class Constant(function.Constant):
 
     def __init__(self, *args, **kwargs):
         value = kwargs.pop('value', 0.)
-        super(Constant, self).__init__(*args, value=YaskGridConst(value), **kwargs)
+        super(Constant, self).__init__(*args, value=DataScalar(value), **kwargs)
 
     @function.Constant.data.setter
     def data(self, val):
-        self._value = YaskGridConst(val)
+        self._value = DataScalar(val)
+
+    def _arg_defaults(self):
+        args = super(Constant, self)._arg_defaults()
+        args[namespace['code-grid-name'](self.name)] = None
+        return args
+
+    def _arg_values(self, alias=None, **kwargs):
+        values = super(Constant, self)._arg_values(**kwargs)
+        values[namespace['code-grid-name'](self.name)] = None
+        return values
 
 
 class Function(function.Function):
 
     from_YASK = True
 
-    def _allocate_memory(self):
+    def _allocate_memory(func):
         """Allocate memory in terms of YASK grids."""
+        def wrapper(self):
+            if self._data is None:
+                log("Allocating memory for %s%s" % (self.name, self.shape_allocated))
 
-        # TODO: YASK assumes that self.shape == "domain_size" (in YASK jargon)
-        # This is exactly how Devito will work too once the Grid abstraction lands
+                # Fetch the appropriate context
+                context = contexts.fetch(self.grid, self.dtype)
 
-        # Fetch the appropriate context
-        context = contexts.fetch(self.grid, self.dtype)
+                # TODO : the following will fail if not using a SteppingDimension,
+                # eg with save=True one gets /time/ instead /t/
+                grid = context.make_grid(self)
 
-        # TODO : the following will fail if not using a SteppingDimension,
-        # eg with save=True one gets /time/ instead /t/
-        self._data_object = context.make_grid(self)
+                # /self._padding/ must be updated as (from the YASK docs):
+                # "The value may be slightly larger [...] due to rounding"
+                padding = [0 if i.is_Time else grid.get_extra_pad_size(i.name)
+                           for i in self.indices]
+                self._padding = tuple((i,)*2 for i in padding)
+
+                self._data = Data(grid, self.shape_allocated, self.indices, self.dtype)
+                self._data.reset()
+            return func(self)
+        return wrapper
+
+    def __del__(self):
+        if self._data is not None:
+            self._data.release_storage()
 
     @property
+    @_allocate_memory
     def _data_buffer(self):
-        return super(Function, self).data
+        ctype = numpy_to_ctypes(self.dtype)
+        cpointer = ctypes.cast(int(self._data.grid.get_raw_storage_buffer()),
+                               ctypes.POINTER(ctype))
+        ndpointer = np.ctypeslib.ndpointer(dtype=self.dtype, shape=self.shape_allocated)
+        casted = ctypes.cast(cpointer, ndpointer)
+        ndarray = np.ctypeslib.as_array(casted, shape=self.shape_allocated)
+        return ndarray
 
     @property
     def data(self):
         """
-        The value of the data object, as a :class:`YaskGrid`.
+        The domain data values, as a :class:`Data`.
 
         The returned object, which behaves as a :class:`numpy.ndarray`, provides
         a *view* of the actual data, in row-major format. Internally, the data is
         stored in whatever layout adopted by YASK.
 
-        Any read/write from/to the returned :class:`YaskGrid` should be performed
+        Any read/write from/to the returned :class:`Data` should be performed
         assuming a row-major storage layout; behind the scenes, these accesses
         are automatically translated into whatever YASK expects, in order to pick
         the intended values.
@@ -65,12 +99,53 @@ class Function(function.Function):
         default Devito backend. Such penalty should however be easily amortizable,
         as the time spent in running Operators is expected to be vastly greater
         than any user-level data manipulation.
+
+        For further information, refer to ``Data.__doc__``.
         """
-        super(Function, self).data
-        return self._data_object
+        return self.data_domain
+
+    @cached_property
+    @_allocate_memory
+    def data_domain(self):
+        """
+        .. note::
+
+            Alias to ``self.data``.
+        """
+        return Data(self._data.grid, self.shape, self.indices, self.dtype,
+                    offset=self._offset_domain.left)
+
+    @cached_property
+    @_allocate_memory
+    def data_with_halo(self):
+        return Data(self._data.grid, self.shape_with_halo, self.indices, self.dtype,
+                    offset=self._offset_halo.left)
+
+    @cached_property
+    @_allocate_memory
+    def data_allocated(self):
+        return Data(self._data.grid, self.shape_allocated, self.indices, self.dtype)
 
     def initialize(self):
         raise NotImplementedError
+
+    def _arg_defaults(self, alias=None):
+        args = super(Function, self)._arg_defaults(alias)
+
+        key = alias or self.name
+        args[namespace['code-grid-name'](key)] = self.data.rawpointer
+
+        return args
+
+    def _arg_values(self, alias=None, **kwargs):
+        new = kwargs.get(self.name)
+        values = super(Function, self)._arg_values(alias=alias, **kwargs)
+
+        key = alias or self.name
+        if key in values and isinstance(new, Function):
+            values[namespace['code-grid-name'](key)] = new.data.rawpointer
+
+        return values
 
 
 class TimeFunction(function.TimeFunction, Function):

@@ -2,7 +2,7 @@ from collections import OrderedDict
 
 import cgen as c
 from mpmath.libmp import prec_to_dps, to_str
-from sympy import Eq, Function
+from sympy import Function
 from sympy.printing.ccode import C99CodePrinter
 
 
@@ -28,16 +28,15 @@ class Allocator(object):
     def push_heap(self, obj):
         """
         Generate cgen objects to declare, allocate memory, and free memory for
-        ``obj``, of type :class:`SymbolicData`.
+        ``obj``, of type :class:`Array`.
         """
         if obj in self.heap:
             return
 
-        decl = "(*%s)%s" % (obj.name,
-                            "".join("[%s]" % i.symbolic_size for i in obj.indices[1:]))
+        decl = "(*%s)%s" % (obj.name, "".join("[%s]" % i for i in obj.symbolic_shape[1:]))
         decl = c.Value(c.dtype_to_ctype(obj.dtype), decl)
 
-        shape = "".join("[%s]" % i.symbolic_size for i in obj.indices)
+        shape = "".join("[%s]" % i for i in obj.symbolic_shape)
         alloc = "posix_memalign((void**)&%s, 64, sizeof(%s%s))"
         alloc = alloc % (obj.name, c.dtype_to_ctype(obj.dtype), shape)
         alloc = c.Statement(alloc)
@@ -68,6 +67,9 @@ class CodePrinter(C99CodePrinter):
     def __init__(self, settings={}):
         C99CodePrinter.__init__(self, settings)
         self.known_functions.update(self.custom_functions)
+
+    def _print_CondEq(self, expr):
+        return "%s == %s" % (self._print(expr.lhs), self._print(expr.rhs))
 
     def _print_Indexed(self, expr):
         """Print field as C style multidimensional array
@@ -150,6 +152,9 @@ class CodePrinter(C99CodePrinter):
     def _print_ListInitializer(self, expr):
         return "{%s}" % ', '.join([self._print(i) for i in expr.params])
 
+    def _print_IntDiv(self, expr):
+        return str(expr)
+
 
 def ccode(expr, **settings):
     """Generate C++ code from an expression calling CodePrinter class
@@ -158,23 +163,7 @@ def ccode(expr, **settings):
     :param settings: A dictionary of settings for code printing
     :returns: The resulting code as a string. If it fails, then it returns the expr
     """
-    if isinstance(expr, Eq):
-        return ccode_eq(expr)
-    try:
-        return CodePrinter(settings).doprint(expr, None)
-    except:
-        return expr
-
-
-def ccode_eq(eq, **settings):
-    """Generate C++ assignment from an equation assigning RHS to LHS
-
-    :param eq: The equation
-    :param settings: A dictionary of settings for code printing
-    :returns: The resulting code as a string
-    """
-    return CodePrinter(settings).doprint(eq.lhs, None) \
-        + ' = ' + CodePrinter(settings).doprint(eq.rhs, None)
+    return CodePrinter(settings).doprint(expr, None)
 
 
 blankline = c.Line("")

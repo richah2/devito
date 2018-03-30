@@ -1,5 +1,5 @@
 from devito import Dimension
-from devito.function import SparseFunction
+from devito.function import SparseTimeFunction
 from devito.logger import error
 
 import numpy as np
@@ -11,7 +11,7 @@ except:
 __all__ = ['PointSource', 'Receiver', 'Shot', 'RickerSource', 'GaborSource']
 
 
-class PointSource(SparseFunction):
+class PointSource(SparseTimeFunction):
     """Symbolic data object for a set of sparse point sources
 
     :param name: Name of the symbol representing this source
@@ -20,6 +20,7 @@ class PointSource(SparseFunction):
     :param data: (Optional) Data values to initialise point data
     :param ntime: (Optional) Number of timesteps for which to allocate data
     :param npoint: (Optional) Number of sparse points represented by this source
+    :param time_order: (Optional) Time discretization order (defaults to 2)
     :param dimension: :(Optional) class:`Dimension` object for
                        representing the number of points in this source
 
@@ -29,7 +30,8 @@ class PointSource(SparseFunction):
 
     def __new__(cls, name, grid, ntime=None, npoint=None, data=None,
                 coordinates=None, **kwargs):
-        p_dim = kwargs.get('dimension', Dimension('p_%s' % name))
+        p_dim = kwargs.get('dimension', Dimension(name='p_%s' % name))
+        time_order = kwargs.get('time_order', 2)
         npoint = npoint or coordinates.shape[0]
         if data is None:
             if ntime is None:
@@ -38,11 +40,11 @@ class PointSource(SparseFunction):
         else:
             ntime = ntime or data.shape[0]
 
-        # Create the underlying SparseFunction object
-        obj = SparseFunction.__new__(cls, name=name, grid=grid,
-                                     dimensions=[grid.time_dim, p_dim],
-                                     npoint=npoint, nt=ntime,
-                                     coordinates=coordinates, **kwargs)
+        # Create the underlying SparseTimeFunction object
+        obj = SparseTimeFunction.__new__(cls, name=name, grid=grid,
+                                         dimensions=[grid.time_dim, p_dim],
+                                         npoint=npoint, nt=ntime, time_order=time_order,
+                                         coordinates=coordinates, **kwargs)
 
         # If provided, copy initial data into the allocated buffer
         if data is not None:
@@ -108,7 +110,7 @@ class WaveletSource(PointSource):
         plt.figure()
         plt.plot(time, wavelet)
         plt.xlabel('Time (ms)')
-        plt.ylabel('Velocity (km/s)')
+        plt.ylabel('Amplitude')
         plt.tick_params()
         plt.show()
 

@@ -1,236 +1,15 @@
 import os
-import sys
 import importlib
 from glob import glob
 from subprocess import call
 from collections import OrderedDict
 
-import ctypes
-import numpy as np
-
 from devito.compiler import make
 from devito.exceptions import CompilationError
 from devito.logger import debug, yask as log
-from devito.tools import numpy_to_ctypes
 
 from devito.yask import cfac, nfac, ofac, namespace, exit, configuration
-from devito.yask.utils import convert_multislice, rawpointer
-
-
-class YaskGrid(object):
-
-    """
-    A ``YaskGrid`` wraps a YASK grid.
-
-    An implementation of an array that behaves similarly to a ``numpy.ndarray``,
-    suitable for the YASK storage layout.
-
-    Subclassing ``numpy.ndarray`` would have led to shadow data copies, because
-    of the different storage layout.
-    """
-
-    # Force __rOP__ methods (OP={add,mul,...) to get arrays, not scalars, for efficiency
-    __array_priority__ = 1000
-
-    def __init__(self, grid, shape, radius, dtype):
-        """
-        Initialize a new :class:`YaskGrid`, a wrapper for a YASK grid.
-
-        The storage layout of a YASK grid is as follows: ::
-
-            --------------------------------------------------------------
-            | extra_padding | halo |              | halo | extra_padding |
-            ------------------------    domain    ------------------------
-            |       padding        |              |       padding        |
-            --------------------------------------------------------------
-            |                         allocation                         |
-            --------------------------------------------------------------
-
-        :param grid: The YASK yk::grid that will be wrapped. Data storage will be
-                     allocated if not yet allocated.
-        :param shape: The "visibility region" of the YaskGrid. The shape should be
-                      at least as big as the domain (in each dimension). If larger,
-                      then users will be allowed to access more data entries,
-                      such as those lying on the halo region.
-        :param radius: The extent of the halo region.
-        :param dtype: The type of the raw data.
-        """
-        self.grid = grid
-        self.shape = shape
-        self.dtype = dtype
-
-        if not self.is_storage_allocated():
-            # Allocate memory in YASK-land and initialize it to 0
-            for i, j in zip(self.dimensions, shape):
-                if i == namespace['time-dim']:
-                    assert self.grid.is_dim_used(i)
-                    assert self.grid.get_alloc_size(i) == j
-                else:
-                    # Note, from the YASK docs:
-                    # "If the halo is set to a value larger than the padding size,
-                    # the padding size will be automatically increase to accomodate it."
-                    self.grid.set_halo_size(i, radius)
-            self.grid.alloc_storage()
-            self._reset()
-
-    def __getitem__(self, index):
-        start, stop, shape = convert_multislice(index, self.shape, self._offsets)
-        if not shape:
-            log("YaskGrid: Getting single entry %s" % str(start))
-            assert start == stop
-            out = self.grid.get_element(start)
-        else:
-            log("YaskGrid: Getting full-array/block via index [%s]" % str(index))
-            out = np.empty(shape, self.dtype, 'C')
-            self.grid.get_elements_in_slice(out.data, start, stop)
-        return out
-
-    def __setitem__(self, index, val):
-        start, stop, shape = convert_multislice(index, self.shape, self._offsets, 'set')
-        if all(i == 1 for i in shape):
-            log("YaskGrid: Setting single entry %s" % str(start))
-            assert start == stop
-            self.grid.set_element(val, start)
-        elif isinstance(val, np.ndarray):
-            log("YaskGrid: Setting full-array/block via index [%s]" % str(index))
-            self.grid.set_elements_in_slice(val, start, stop)
-        elif all(i == j-1 for i, j in zip(shape, self.shape)):
-            log("YaskGrid: Setting full-array to given scalar via single grid sweep")
-            self.grid.set_all_elements_same(val)
-        else:
-            log("YaskGrid: Setting block to given scalar via index [%s]" % str(index))
-            self.grid.set_elements_in_slice_same(val, start, stop, True)
-
-    def __getslice__(self, start, stop):
-        if stop == sys.maxint:
-            # Emulate default NumPy behaviour
-            stop = None
-        return self.__getitem__(slice(start, stop))
-
-    def __setslice__(self, start, stop, val):
-        if stop == sys.maxint:
-            # Emulate default NumPy behaviour
-            stop = None
-        self.__setitem__(slice(start, stop), val)
-
-    def __getattr__(self, name):
-        """Proxy to yk::grid methods."""
-        return getattr(self.grid, name)
-
-    def __repr__(self):
-        return repr(self[:])
-
-    def __meta_binop(op):
-        # Used to build all binary operations such as __eq__, __add__, etc.
-        # These all boil down to calling the numpy equivalents
-        def f(self, other):
-            return getattr(self[:], op)(other)
-        return f
-    __eq__ = __meta_binop('__eq__')
-    __ne__ = __meta_binop('__ne__')
-    __le__ = __meta_binop('__le__')
-    __lt__ = __meta_binop('__lt__')
-    __ge__ = __meta_binop('__ge__')
-    __gt__ = __meta_binop('__gt__')
-    __add__ = __meta_binop('__add__')
-    __radd__ = __meta_binop('__add__')
-    __sub__ = __meta_binop('__sub__')
-    __rsub__ = __meta_binop('__sub__')
-    __mul__ = __meta_binop('__mul__')
-    __rmul__ = __meta_binop('__mul__')
-    __div__ = __meta_binop('__div__')
-    __rdiv__ = __meta_binop('__div__')
-    __truediv__ = __meta_binop('__truediv__')
-    __rtruediv__ = __meta_binop('__truediv__')
-    __mod__ = __meta_binop('__mod__')
-    __rmod__ = __meta_binop('__mod__')
-
-    def _reset(self):
-        """
-        Reset grid value to 0.
-        """
-        self[:] = 0.0
-
-    @property
-    def _halo(self):
-        return [0 if i == namespace['time-dim'] else self.get_halo_size(i)
-                for i in self.dimensions]
-
-    @property
-    def _padding(self):
-        return [0 if i == namespace['time-dim'] else self.get_pad_size(i)
-                for i in self.dimensions]
-
-    @property
-    def _offsets(self):
-        offsets = []
-        for i, j in zip(self.dimensions, self._padding):
-            ofs = 0 if i == namespace['time-dim'] else self.get_first_rank_alloc_index(i)
-            offsets.append(ofs + j)
-        return offsets
-
-    @property
-    def with_halo(self):
-        """
-        Return a new wrapper to self's YASK grid in which the halo has been
-        unmasked. This allows the caller to write/read the halo region as well as
-        the domain.
-        """
-        return YaskGridWithHalo(self.grid, self.shape, 0, self.dtype)
-
-    @property
-    def name(self):
-        return self.grid.get_name()
-
-    @property
-    def dimensions(self):
-        return self.grid.get_dim_names()
-
-    @property
-    def ndpointer(self):
-        """Return a :class:`numpy.ndarray` view of the grid content."""
-        ctype = numpy_to_ctypes(self.dtype)
-        cpointer = ctypes.cast(int(self.grid.get_raw_storage_buffer()),
-                               ctypes.POINTER(ctype))
-        ndpointer = np.ctypeslib.ndpointer(dtype=self.dtype, shape=self.shape)
-        casted = ctypes.cast(cpointer, ndpointer)
-        ndarray = np.ctypeslib.as_array(casted, shape=self.shape)
-        return ndarray
-
-    @property
-    def rawpointer(self):
-        return rawpointer(self.grid)
-
-    def give_storage(self, target):
-        """
-        Share self's storage with ``target``.
-        """
-        for i in self.dimensions:
-            if i == namespace['time-dim']:
-                target.set_alloc_size(i, self.get_alloc_size(i))
-            else:
-                target.set_halo_size(i, self.get_halo_size(i))
-        target.share_storage(self.grid)
-
-    def view(self):
-        """
-        View of the YASK grid in standard (i.e., Devito) row-major layout.
-        """
-        return self[:]
-
-
-class YaskGridWithHalo(YaskGrid):
-
-    """A helper class for YaskGrid wrappers providing access to the halo region."""
-
-    def __init__(self, grid, shape, radius, dtype):
-        super(YaskGridWithHalo, self).__init__(grid, shape, radius, dtype)
-        self.shape = [i + 2*j for i, j in zip(self.shape, self._halo)]
-
-    @property
-    def _offsets(self):
-        offsets = super(YaskGridWithHalo, self)._offsets
-        return [i - j for i, j in zip(offsets, self._halo)]
+from devito.yask.utils import rawpointer
 
 
 class YaskKernel(object):
@@ -328,14 +107,13 @@ class YaskKernel(object):
         return self.soln.new_fixed_size_grid(name, [str(i) for i in obj.indices],
                                              [int(i) for i in obj.shape])  # cast np.int
 
-    def run(self, cfunction, arguments, toshare):
+    def run(self, cfunction, arg_values, toshare):
         """
         Run the YaskKernel through a JIT-compiled function.
 
         :param cfunction: The JIT-compiler function, of type :class:`ctypes.FuncPtr`
-        :param arguments: Mapper from function/dimension/... names to run-time values
-               to be passed to ``cfunction``.
-        :param toshare: Mapper from functions to :class:`YaskGrid`s for sharing
+        :param arg_values: The run-time values to be passed to ``cfunction``.
+        :param toshare: Mapper from functions to :class:`Data`s for sharing
                         grid storage.
         """
         # Sanity check
@@ -349,7 +127,7 @@ class YaskKernel(object):
         for k, v in toshare.items():
             target = self.grids.get(k.name)
             if target is not None:
-                v.give_storage(target)
+                v._give_storage(target)
         assert all(not i.is_storage_allocated() for i in self.local_grids.values())
         assert all(v.is_storage_allocated() for k, v in self.grids.items()
                    if k not in self.local_grids)
@@ -385,7 +163,7 @@ class YaskKernel(object):
             self.soln.run_auto_tuner_now()
 
         # Run the kernel
-        cfunction(*list(arguments.values()))
+        cfunction(*arg_values)
 
         # Release grid storage. Note: this *will not* cause deallocation, as these
         # grids are actually shared with the hook solution
@@ -419,8 +197,8 @@ class YaskContext(object):
         """
         Proxy between Devito and YASK.
 
-        A YaskContext contains N YaskKernel and M YaskGrids, which have space
-        and time dimensions in common.
+        A ``YaskContext`` contains N :class:`YaskKernel` and M :class:`Data`,
+        which have common space and time dimensions.
 
         :param name: Unique name of the context.
         :param grid: A :class:`Grid` carrying the context dimensions.
@@ -459,19 +237,36 @@ class YaskContext(object):
 
     def make_grid(self, obj):
         """
-        Create and return a new :class:`YaskGrid`, a YASK grid wrapper. Memory
+        Create and return a new :class:`Data`, a YASK grid wrapper. Memory
         is allocated.
 
-        :param obj: The symbolic data object for which a YASK grid is allocated.
+        :param obj: The :class:`Function` for which a YASK grid is allocated.
         """
         if set(obj.indices) < set(self.space_dimensions):
             exit("Need a Function[x,y,z] to create a YASK grid.")
+
         name = 'devito_%s_%d' % (obj.name, contexts.ngrids)
-        log("Allocating YaskGrid for %s (%s)" % (obj.name, str(obj.shape)))
+
+        # Set up the YASK grid and allocate memory
         grid = self.yk_hook.new_grid(name, obj)
-        wrapper = YaskGrid(grid, obj.shape, obj.space_order, obj.dtype)
-        self.grids[name] = wrapper
-        return wrapper
+        for i, s, h in zip(obj.indices, obj.shape_allocated, obj._extent_halo):
+            if i.is_Time:
+                assert grid.is_dim_used(i.name)
+                assert grid.get_alloc_size(i.name) == s
+            else:
+                # Note:
+                # 1) The halo is set to a value which is the max between the number
+                # of points on the left and the number of points on the right of
+                # the approximation (the same with a centered approximation)
+                # 2) from the YASK docs: "If the halo is set to a value larger than
+                # the padding size, the padding size will be automatically increased
+                # to accomodate it
+                grid.set_halo_size(i.name, max(h))
+        grid.alloc_storage()
+
+        self.grids[name] = grid
+
+        return grid
 
     def make_yc_solution(self, namer):
         """
@@ -567,20 +362,6 @@ contexts = ContextManager()
 
 # Helpers
 
-class YaskGridConst(np.float64):
-
-    """A YASK grid wrapper for scalar values."""
-
-    def give_storage(self, target):
-        if not target.is_storage_allocated():
-            target.alloc_storage()
-        target.set_element(float(self.real), [])
-
-    @property
-    def rawpointer(self):
-        return None
-
-
 class YaskNullKernel(object):
 
     """Used when an Operator doesn't actually have a YASK-offloadable tree."""
@@ -590,8 +371,12 @@ class YaskNullKernel(object):
         self.grids = {}
         self.local_grids = {}
 
-    def run(self, cfunction, arguments, toshare):
-        cfunction(*list(arguments.values()))
+    def run(self, cfunction, arg_values, toshare):
+        cfunction(*arg_values)
+
+    @property
+    def rawpointer(self):
+        return None
 
 
 class YaskNullContext(object):

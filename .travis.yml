@@ -12,16 +12,44 @@ matrix:
   include:
     - os: linux
       python: "3.6"
+      addons:
+        apt:
+          sources:
+            - ubuntu-toolchain-r-test     # For gcc 4.9, 5 and 7
+          packages:
+            - gcc-4.9
+            - g++-4.9
       env: DEVITO_ARCH=gcc-4.9 DEVITO_OPENMP=0
     - os: linux
       python: "3.6"
+      addons:
+        apt:
+          sources:
+            - ubuntu-toolchain-r-test     # For gcc 4.9, 5 and 7
+          packages:
+            - gcc-5
+            - g++-5
       env: DEVITO_ARCH=gcc-5 DEVITO_OPENMP=0
     - os: linux
       python: "3.6"
+      addons:
+        apt:
+          sources:
+            - ubuntu-toolchain-r-test     # For gcc 4.9, 5 and 7
+          packages:
+            - gcc-4.9
+            - g++-4.9
       env: DEVITO_ARCH=gcc-4.9 DEVITO_OPENMP=1 OMP_NUM_THREADS=2
     - os: linux
       python: "3.6"
-      env: DEVITO_ARCH=gcc-4.9 DEVITO_OPENMP=0 DEVITO_BACKEND=yask
+      addons:
+        apt:
+          sources:
+            - ubuntu-toolchain-r-test     # For gcc 4.9, 5 and 7
+          packages:
+            - gcc-7
+            - g++-7
+      env: DEVITO_ARCH=gcc-7 DEVITO_OPENMP=0 DEVITO_BACKEND=yask
   allow_failures:
     - os: linux
       python: "2.7"
@@ -33,12 +61,7 @@ matrix:
 addons:
   apt:
     sources:
-      - ubuntu-toolchain-r-test     # For gcc 4.9 and 5
-    packages:
-      - gcc-4.9
-      - g++-4.9
-      - gcc-5
-      - g++-5
+      - ubuntu-toolchain-r-test     # For gcc 4.9, 5 and 7
 
 before_install:
   # Setup anaconda
@@ -59,34 +82,38 @@ install:
   - conda env create -q -f environment.yml python=$TRAVIS_PYTHON_VERSION
   - source activate devito
   - pip install -e .
+  # Dump all package versions
+  - conda list
 
 before_script:
   - echo -e "Host github.com\n\tStrictHostKeyChecking no\n" >> ~/.ssh/config
   - if [[ $DEVITO_BACKEND == 'yask' ]]; then
       conda install swig; cd ../;
       git clone https://github.com/opesci/yask.git;
-      cd yask; git checkout develop;
-      make compiler && make compiler-api; pip install -e .; cd ../devito;
+      cd yask; make compiler && make compiler-api; pip install -e .; cd ../devito;
     fi
 
 script:
   - flake8 --builtins=ArgumentError .
-  - py.test -vs tests/
+  - py.test -vs --cov devito tests/
 
   # Additional seismic operator tests
-  - if [[ $DEVITO_BACKEND != 'yask' ]]; then
-      DEVITO_BACKEND=foreign py.test -vs tests/test_operator.py -k TestForeign;
-      python examples/seismic/benchmark.py test -P tti -so 4 -a -d 20 20 20 -n 5;
-      python examples/seismic/benchmark.py test -P acoustic -a;
-      python examples/seismic/acoustic/acoustic_example.py --full;
-      python examples/seismic/acoustic/acoustic_example.py --constant --full;
-      python examples/seismic/acoustic/gradient_example.py;
-      python examples/checkpointing/checkpointing_example.py;
-    fi
+  - if [[ $DEVITO_BACKEND != 'yask' ]]; then DEVITO_BACKEND=foreign py.test -vs tests/test_operator.py -k TestForeign; fi
+  - if [[ $DEVITO_BACKEND != 'yask' ]]; then python examples/seismic/benchmark.py test -P tti -so 4 -a -d 20 20 20 -n 5; fi
+  - if [[ $DEVITO_BACKEND != 'yask' ]]; then python examples/seismic/benchmark.py test -P acoustic -a; fi
+  - if [[ $DEVITO_BACKEND != 'yask' ]]; then python examples/seismic/acoustic/acoustic_example.py --full; fi
+  - if [[ $DEVITO_BACKEND != 'yask' ]]; then python examples/seismic/acoustic/acoustic_example.py --constant --full; fi
+  - if [[ $DEVITO_BACKEND != 'yask' ]]; then python examples/seismic/acoustic/gradient_example.py; fi
+  - if [[ $DEVITO_BACKEND != 'yask' ]]; then python examples/misc/linalg.py mat-vec mat-mat-sum transpose-mat-vec; fi
+  - if [[ $DEVITO_BACKEND != 'yask' ]]; then python examples/seismic/tti/tti_example.py -a; fi
+  - if [[ $DEVITO_BACKEND != 'yask' ]]; then python examples/checkpointing/checkpointing_example.py; fi
 
   # Test tutorial notebooks for the website using nbval
   - if [[ $DEVITO_BACKEND != 'yask' ]]; then py.test -vs --nbval examples/seismic/tutorials; fi
   - if [[ $DEVITO_BACKEND != 'yask' ]]; then py.test -vs --nbval examples/cfd; fi
+
+  # Code coverage
+  - codecov
 
   # Docs generation
   - sphinx-apidoc -f -o docs/ examples

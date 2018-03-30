@@ -2,8 +2,14 @@ import pytest
 
 from conftest import EVAL, time, x, y, z, skipif_yask  # noqa
 
-from devito import Eq  # noqa
+from devito import Eq, Grid, TimeFunction  # noqa
+from devito.ir.equations import LoweredEq
+from devito.ir.iet.nodes import Conditional, Expression
 from devito.ir.support.basic import IterationInstance, TimedAccess, Scope
+from devito.ir.support.space import (NullInterval, Interval, IntervalGroup,
+                                     Any, Forward, Backward)
+from devito.ir.support.utils import detect_flow_directions
+from devito.symbolics import indexify
 
 
 @pytest.fixture(scope="session")
@@ -25,14 +31,14 @@ def ii_literal(fa, fc):
 
 @pytest.fixture(scope="session")
 def ta_literal(fc):
-    tcxy_w0 = TimedAccess(fc[x, y], 'W', 0)
-    tcxy_r0 = TimedAccess(fc[x, y], 'R', 0)
-    tcx1y1_r1 = TimedAccess(fc[x + 1, y + 1], 'R', 1)
-    tcx1y_r1 = TimedAccess(fc[x + 1, y], 'R', 1)
-    x.reverse = True
-    rev_tcxy_w0 = TimedAccess(fc[x, y], 'W', 0)
-    rev_tcx1y1_r1 = TimedAccess(fc[x + 1, y + 1], 'R', 1)
-    x.reverse = False
+    fwd_directions = {x: Forward, y: Forward}
+    mixed_directions = {x: Backward, y: Forward}
+    tcxy_w0 = TimedAccess(fc[x, y], 'W', 0, fwd_directions)
+    tcxy_r0 = TimedAccess(fc[x, y], 'R', 0, fwd_directions)
+    tcx1y1_r1 = TimedAccess(fc[x + 1, y + 1], 'R', 1, fwd_directions)
+    tcx1y_r1 = TimedAccess(fc[x + 1, y], 'R', 1, fwd_directions)
+    rev_tcxy_w0 = TimedAccess(fc[x, y], 'W', 0, mixed_directions)
+    rev_tcx1y1_r1 = TimedAccess(fc[x + 1, y + 1], 'R', 1, mixed_directions)
     return tcxy_w0, tcxy_r0, tcx1y1_r1, tcx1y_r1, rev_tcxy_w0, rev_tcx1y1_r1
 
 
@@ -138,6 +144,7 @@ def test_iteration_instance_distance(dims, ii_num, ii_literal):
     assert fcxy.distance(fcx1y, y) == (-1, 0)
 
 
+@skipif_yask
 def test_timed_access_cmp(ta_literal):
     """
     Tests comparison of objects of type TimedAccess.
@@ -200,7 +207,11 @@ def test_dependences_eq(expr, expected, ti0, ti1, fa):
         * the dimension causing the dependence
         * whether it's direct or indirect (i.e., through A[B[i]])
     """
-    expr = EVAL(expr, ti0.base, ti1.base, fa)
+    expr = LoweredEq(EVAL(expr, ti0.base, ti1.base, fa))
+
+    # Force innatural flow, only to stress the compiler to see if it was
+    # capable of detecting anti-dependences
+    expr.ispace._directions = {i: Forward for i in expr.ispace.directions}
 
     scope = Scope(expr)
     deps = scope.d_all
@@ -297,8 +308,13 @@ def test_dependences_scope(exprs, expected, ti0, ti1, ti3, fa):
         * if it's a flow, anti, or output dependence
         * the dimension causing the dependence
     """
-    exprs = EVAL(exprs, ti0.base, ti1.base, ti3.base, fa)
+    exprs = [LoweredEq(i) for i in EVAL(exprs, ti0.base, ti1.base, ti3.base, fa)]
     expected = [tuple(i.split(',')) for i in expected]
+
+    # Force innatural flow, only to stress the compiler to see if it was
+    # capable of detecting anti-dependences
+    for i in exprs:
+        i.ispace._directions = {i: Forward for i in i.ispace.directions}
 
     scope = Scope(exprs)
     assert len(scope.d_all) == len(expected)
@@ -311,3 +327,163 @@ def test_dependences_scope(exprs, expected, ti0, ti1, ti3, fa):
 
     # Sanity check: we did find all of the expected dependences
     assert len(expected) == 0
+
+
+@skipif_yask
+def test_flow_detection():
+    """Test detection of information flow."""
+    grid = Grid((10, 10))
+    u2 = TimeFunction(name="u2", grid=grid, time_order=2)
+    u1 = TimeFunction(name="u1", grid=grid, save=10, time_order=2)
+    exprs = [LoweredEq(indexify(Eq(u1.forward, u1 + 2.0 - u1.backward))),
+             LoweredEq(indexify(Eq(u2.forward, u2 + 2*u2.backward - u1.dt2)))]
+    mapper = detect_flow_directions(exprs)
+    assert mapper.get(grid.stepping_dim) == {Forward}
+    assert mapper.get(grid.time_dim) == {Any, Forward}
+    assert all(mapper.get(i) == {Any} for i in grid.dimensions)
+
+
+@skipif_yask
+def test_intervals_intersection():
+    nullx = NullInterval(x)
+
+    # All nulls
+    assert nullx.intersection(nullx) == nullx
+
+    nully = NullInterval(y)
+    ix = Interval(x, -2, 2)
+    iy = Interval(y, -2, 2)
+
+    # Mixed nulls and defined
+    assert nullx.intersection(ix) == nullx
+    assert nullx.intersection(iy) == nullx
+    assert nullx.intersection(iy) != nully
+    assert nully.intersection(iy) == nully
+
+    ix2 = Interval(x, -8, -3)
+    ix3 = Interval(x, 3, 4)
+
+    # All defined disjoint
+    assert ix.intersection(ix2) == nullx
+    assert ix.intersection(ix3) == nullx
+    assert ix2.intersection(ix3) == nullx
+    assert ix.intersection(iy) == nullx
+    assert iy.intersection(ix) == nully
+
+    ix4 = Interval(x, 1, 4)
+    ix5 = Interval(x, -3, 0)
+
+    # All defined overlapping
+    assert ix.intersection(ix4) == Interval(x, 1, 2)
+    assert ix.intersection(ix5) == Interval(x, -2, 0)
+
+
+@skipif_yask
+def test_intervals_union():
+    nullx = NullInterval(x)
+
+    # All nulls
+    assert nullx.union(nullx) == nullx
+
+    ix = Interval(x, -2, 2)
+
+    # Mixed nulls and defined on the same dimension
+    assert nullx.union(ix) == ix
+    assert ix.union(ix) == ix
+    assert ix.union(nullx) == ix
+
+    ix2 = Interval(x, 1, 4)
+    ix3 = Interval(x, -3, 6)
+
+    # All defined overlapping
+    assert ix.union(ix2) == Interval(x, -2, 4)
+    assert ix.union(ix3) == ix3
+    assert ix2.union(ix3) == ix3
+
+    ix4 = Interval(x, 4, 8)
+    ix5 = Interval(x, -3, -3)
+    ix6 = Interval(x, -10, -3)
+    nully = NullInterval(y)
+    iy = Interval(y, -2, 2)
+
+    # Mixed disjoint (note: IntervalGroup input order is irrelevant)
+    assert ix.union(ix4) == IntervalGroup([ix4, ix])
+    assert ix.union(ix5) == Interval(x, -3, 2)
+    assert ix6.union(ix) == IntervalGroup([ix, ix6])
+    assert ix.union(nully) == IntervalGroup([ix, nully])
+    assert ix.union(iy) == IntervalGroup([iy, ix])
+    assert iy.union(ix) == IntervalGroup([iy, ix])
+
+
+@skipif_yask
+def test_intervals_merge():
+    nullx = NullInterval(x)
+
+    # All nulls
+    assert nullx.merge(nullx) == nullx
+
+    ix = Interval(x, -2, 2)
+
+    # Mixed nulls and defined on the same dimension
+    assert nullx.merge(ix) == ix
+    assert ix.merge(ix) == ix
+    assert ix.merge(nullx) == ix
+
+    ix2 = Interval(x, 1, 4)
+    ix3 = Interval(x, -3, 6)
+
+    # All defined overlapping
+    assert ix.merge(ix2) == Interval(x, -2, 4)
+    assert ix.merge(ix3) == ix3
+    assert ix2.merge(ix3) == ix3
+
+    ix4 = Interval(x, 0, 0)
+    ix5 = Interval(x, -1, -1)
+    ix6 = Interval(x, 9, 11)
+
+    # Non-overlapping
+    assert ix.merge(ix4) == Interval(x, -2, 2)
+    assert ix.merge(ix5) == Interval(x, -2, 2)
+    assert ix4.merge(ix5) == Interval(x, -1, 0)
+    assert ix.merge(ix6) == Interval(x, -2, 11)
+    assert ix6.merge(ix) == Interval(x, -2, 11)
+    assert ix5.merge(ix6) == Interval(x, -1, 11)
+
+
+@skipif_yask
+def test_intervals_subtract():
+    nullx = NullInterval(x)
+
+    # All nulls
+    assert nullx.subtract(nullx) == nullx
+
+    ix = Interval(x, 2, -2)
+
+    # Mixed nulls and defined on the same dimension
+    assert nullx.subtract(ix) == nullx
+    assert ix.subtract(ix) == Interval(x, 0, 0)
+    assert ix.subtract(nullx) == ix
+
+    ix2 = Interval(x, 4, -4)
+    ix3 = Interval(x, 6, -6)
+
+    # All defined same dimension
+    assert ix2.subtract(ix) == ix
+    assert ix.subtract(ix2) == Interval(x, -2, 2)
+    assert ix3.subtract(ix) == ix2
+
+
+@skipif_yask
+def test_iet_conditional(fc):
+    then_body = Expression(Eq(fc[x, y], fc[x, y] + 1))
+    else_body = Expression(Eq(fc[x, y], fc[x, y] + 2))
+    conditional = Conditional(x < 3, then_body, else_body)
+    assert str(conditional) == """\
+if (x < 3)
+{
+  fc[x][y] = fc[x][y] + 1;
+}
+else
+{
+  fc[x][y] = fc[x][y] + 2;
+}"""

@@ -7,16 +7,19 @@ from sympy import Indexed
 from devito.cgen_utils import ccode
 from devito.compiler import jit_compile
 from devito.dimension import LoweredDimension
-from devito.types import Object
 from devito.logger import yask as log, yask_warning as warning
-from devito.ir.iet import (Element, IsPerfectIteration, Transformer,
-                           filter_iterations, retrieve_iteration_tree)
-from devito.operator import OperatorRunnable, FunMeta
+from devito.ir.equations import LoweredEq
+from devito.ir.iet import (Element, List, PointerCast, MetaCall, IsPerfectIteration,
+                           Transformer, filter_iterations, retrieve_iteration_tree)
+from devito.operator import OperatorRunnable
 from devito.tools import flatten
+from devito.types import Object
 
 from devito.yask import nfac, namespace, exit, configuration
+from devito.yask.data import DataScalar
 from devito.yask.utils import make_grid_accesses, make_sharedptr_funcall, rawpointer
-from devito.yask.wrappers import YaskGridConst, YaskNullContext, YaskNullKernel, contexts
+from devito.yask.wrappers import YaskNullContext, YaskNullKernel, contexts
+from devito.yask.types import YaskGridObject
 
 __all__ = ['Operator']
 
@@ -39,17 +42,25 @@ class Operator(OperatorRunnable):
         # list of linked libraries
         self._compiler = configuration.yask['compiler'].copy()
 
-    def _specialize(self, nodes, parameters):
-        """
-        Create a YASK representation of this Iteration/Expression tree.
+    def _specialize_exprs(self, expressions):
+        expressions = super(Operator, self)._specialize_exprs(expressions)
+        # No matter whether offloading will occur or not, all YASK grids accept
+        # negative indices when using the get/set_element_* methods (up to the
+        # padding extent), so the OOB-relative data space should be adjusted
+        return [LoweredEq(e, e.ispace,
+                          e.dspace.zero([d for d in e.dimensions if d.is_Space]),
+                          e.reads, e.writes)
+                for e in expressions]
 
-        ``parameters`` is modified in-place adding YASK-related arguments.
-        """
+    def _specialize_iet(self, nodes):
+        """Transform the Iteration/Expression tree to offload the computation of
+        one or more loop nests onto YASK. This involves calling the YASK compiler
+        to generate YASK code. Such YASK code is then called from within the
+        transformed Iteration/Expression tree."""
         log("Specializing a Devito Operator for YASK...")
 
         self.context = YaskNullContext()
         self.yk_soln = YaskNullKernel()
-        local_grids = []
 
         offloadable = find_offloadable_trees(nodes)
         if len(offloadable) == 0:
@@ -72,22 +83,18 @@ class Operator(OperatorRunnable):
                 nodes = Transformer({tree[1]: funcall}).visit(nodes)
 
                 # Track /funcall/ as an external function call
-                self.func_table[namespace['code-soln-run']] = FunMeta(None, False)
+                self.func_table[namespace['code-soln-run']] = MetaCall(None, False)
 
                 # JIT-compile the newly-created YASK kernel
-                local_grids += [i for i in transform.mapper if i.is_Array]
+                local_grids = [i for i in transform.mapper if i.is_Array]
                 self.yk_soln = self.context.make_yk_solution(namespace['jit-yk-soln'],
                                                              yc_soln, local_grids)
-
-                # Now we must drop a pointer to the YASK solution down to C-land
-                parameters.append(Object(namespace['code-soln-name'],
-                                         namespace['type-solution'],
-                                         self.yk_soln.rawpointer))
 
                 # Print some useful information about the newly constructed solution
                 log("Solution '%s' contains %d grid(s) and %d equation(s)." %
                     (yc_soln.get_name(), yc_soln.get_num_grids(),
                      yc_soln.get_num_equations()))
+
             except:
                 log("Unable to offload a candidate tree.")
         else:
@@ -98,59 +105,60 @@ class Operator(OperatorRunnable):
         # in storage layout employed by Devito and YASK
         nodes = make_grid_accesses(nodes)
 
-        # Update the parameters list adding all necessary YASK grids
-        for i in list(parameters) + local_grids:
-            try:
-                if i.from_YASK:
-                    parameters.append(Object(namespace['code-grid-name'](i.name),
-                                             namespace['type-grid']))
-            except AttributeError:
-                # Ignore e.g. Dimensions
-                pass
-
         log("Specialization successfully performed!")
 
         return nodes
 
+    def _build_parameters(self, nodes):
+        parameters = super(Operator, self)._build_parameters(nodes)
+        # Add parameters "disappeared" due to offloading
+        parameters += tuple(i for i in self.input if i not in parameters)
+        return parameters
+
+    def _build_casts(self, nodes):
+        nodes = super(Operator, self)._build_casts(nodes)
+
+        # Add YASK solution pointer for use in C-land
+        soln_obj = Object(namespace['code-soln-name'], namespace['type-solution'])
+
+        # Add YASK user and local grids pointers for use in C-land
+        grid_objs = [YaskGridObject(i.name) for i in self.input if i.from_YASK]
+        grid_objs.extend([YaskGridObject(i) for i in self.yk_soln.local_grids])
+
+        # Build pointer casts
+        casts = [PointerCast(soln_obj)] + [PointerCast(i) for i in grid_objs]
+
+        return List(body=casts + [nodes])
+
     def arguments(self, **kwargs):
-        mapper = {i.name: i for i in self.parameters}
-        local_grids_mapper = {namespace['code-grid-name'](k): v
-                              for k, v in self.yk_soln.local_grids.items()}
-
-        # The user has the illusion to provide plain data objects to the
-        # generated kernels, but what we actually need and thus going to
-        # provide are pointers to the wrapped YASK grids.
-        toshare = {}
-        for i in self.parameters:
-            grid_arg = mapper.get(namespace['code-grid-name'](i.name))
-            if grid_arg is not None:
-                assert i.provider.from_YASK is True
-                obj = kwargs.get(i.name, i.provider)
-                # Get the associated YaskGrid wrapper (scalars are a special case)
-                if np.isscalar(obj):
-                    wrapper = YaskGridConst(obj)
-                    toshare[i.provider] = wrapper
-                else:
-                    wrapper = obj.data
-                    toshare[obj] = wrapper
-                # Add C-level pointer to the YASK grids
-                assert grid_arg.verify(wrapper.rawpointer)
-            elif i.name in local_grids_mapper:
-                # Add C-level pointer to the temporary YASK grids
-                assert i.verify(rawpointer(local_grids_mapper[i.name]))
-
-        return super(Operator, self).arguments(**kwargs), toshare
+        args = {}
+        # Add in solution pointer
+        args[namespace['code-soln-name']] = self.yk_soln.rawpointer
+        # Add in local grids pointers
+        for k, v in self.yk_soln.local_grids.items():
+            args[namespace['code-grid-name'](k)] = rawpointer(v)
+        return super(Operator, self).arguments(backend=args, **kwargs)
 
     def apply(self, **kwargs):
         # Build the arguments list to invoke the kernel function
-        arguments, toshare = self.arguments(**kwargs)
+        args = self.arguments(**kwargs)
+
+        # Map default Functions to runtime Functions; will be used for "grid sharing"
+        toshare = {}
+        for i in self.input:
+            v = kwargs.get(i.name, i)
+            if np.isscalar(v):
+                toshare[i] = DataScalar(v)
+            elif i.from_YASK and (i.is_Constant or i.is_Function):
+                toshare[v] = v.data
 
         log("Running YASK Operator through Devito...")
-        self.yk_soln.run(self.cfunction, arguments, toshare)
+        arg_values = [args[p.name] for p in self.parameters]
+        self.yk_soln.run(self.cfunction, arg_values, toshare)
         log("YASK Operator successfully run!")
 
         # Output summary of performance achieved
-        return self._profile_output(arguments)
+        return self._profile_output(args)
 
     @property
     def compile(self):
@@ -268,7 +276,7 @@ def find_offloadable_trees(nodes):
         if not parallel:
             # Cannot offload non-parallel loops
             continue
-        if not (IsPerfectIteration().visit(tree) and
+        if not (IsPerfectIteration().visit(parallel[0]) and
                 all(i.is_Expression for i in tree[-1].nodes)):
             # Don't know how to offload this Iteration/Expression to YASK
             continue

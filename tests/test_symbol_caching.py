@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from conftest import skipif_yask
 
-from devito import (Grid, Function, TimeFunction, SparseFunction, Constant,
+from devito import (Grid, Function, TimeFunction, SparseTimeFunction, Constant,
                     Operator, Eq, clear_cache)
 from devito.types import _SymbolCache
 
@@ -137,8 +137,8 @@ def test_symbol_cache_aliasing_reverse():
 
 @skipif_yask
 def test_clear_cache(nx=1000, ny=1000):
-    clear_cache()
     grid = Grid(shape=(nx, ny), dtype=np.float64)
+    clear_cache()
     cache_size = len(_SymbolCache)
 
     for i in range(10):
@@ -198,11 +198,11 @@ def test_operator_leakage_function():
 def test_operator_leakage_sparse():
     """
     Test to ensure that :class:`Operator` creation does not cause
-    memory leaks for :class:`SparseFunction` symbols.
+    memory leaks for :class:`SparseTimeFunction` symbols.
     """
     grid = Grid(shape=(5, 6))
     a = Function(name='a', grid=grid)
-    s = SparseFunction(name='s', grid=grid, npoint=1, nt=1)
+    s = SparseTimeFunction(name='s', grid=grid, npoint=1, nt=1)
     w_a = weakref.ref(a)
     w_s = weakref.ref(s)
 

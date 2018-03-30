@@ -3,16 +3,16 @@ import pytest
 from numpy import linalg
 from conftest import skipif_yask
 
-from devito.logger import info
+from devito import Function, info
 from examples.seismic.acoustic.acoustic_example import smooth10, acoustic_setup as setup
 from examples.seismic import Receiver
 
 
 @skipif_yask
 @pytest.mark.parametrize('space_order', [4])
-@pytest.mark.parametrize('time_order', [2])
+@pytest.mark.parametrize('kernel', ['OT2'])
 @pytest.mark.parametrize('shape', [(70, 80)])
-def test_gradientFWI(shape, time_order, space_order):
+def test_gradientFWI(shape, kernel, space_order):
     """
     This test ensure that the FWI gradient computed with devito
     satisfies the Taylor expansion property:
@@ -34,11 +34,13 @@ def test_gradientFWI(shape, time_order, space_order):
     :return: assertion that the Taylor properties are satisfied
     """
     spacing = tuple(15. for _ in shape)
-    wave = setup(shape=shape, spacing=spacing,
-                 time_order=time_order, space_order=space_order,
+    wave = setup(shape=shape, spacing=spacing, dtype=np.float64,
+                 kernel=kernel, space_order=space_order,
                  nbpml=10+space_order/2)
-    m0 = smooth10(wave.model.m.data, wave.model.shape_domain)
-    dm = np.float32(wave.model.m.data - m0)
+
+    m0 = Function(name='m0', grid=wave.model.m.grid, space_order=space_order)
+    m0.data[:] = smooth10(wave.model.m.data, wave.model.m.shape_domain)
+    dm = np.float32(wave.model.m.data - m0.data)
 
     # Compute receiver data for the true velocity
     rec, u, _ = wave.forward()
@@ -48,8 +50,7 @@ def test_gradientFWI(shape, time_order, space_order):
     # Objective function value
     F0 = .5*linalg.norm(rec0.data - rec.data)**2
     # Gradient: <J^T \delta d, dm>
-    residual = Receiver(name='rec', grid=wave.model.grid,
-                        data=rec0.data - rec.data,
+    residual = Receiver(name='rec', grid=wave.model.grid, data=rec0.data - rec.data,
                         coordinates=rec0.coordinates.data)
     gradient, _ = wave.gradient(residual, u0, m=m0)
     G = np.dot(gradient.data.reshape(-1), dm.reshape(-1))
@@ -60,7 +61,10 @@ def test_gradientFWI(shape, time_order, space_order):
     error2 = np.zeros(7)
     for i in range(0, 7):
         # Add the perturbation to the model
-        mloc = m0 + H[i] * dm
+        def initializer(data):
+            data[:] = m0.data + H[i] * dm
+        mloc = Function(name='mloc', grid=wave.model.m.grid, space_order=space_order,
+                        initializer=initializer)
         # Data for the new model
         d = wave.forward(m=mloc)[0]
         # First order error Phi(m0+dm) - Phi(m0)
@@ -79,9 +83,9 @@ def test_gradientFWI(shape, time_order, space_order):
 
 @skipif_yask
 @pytest.mark.parametrize('space_order', [4])
-@pytest.mark.parametrize('time_order', [2])
+@pytest.mark.parametrize('kernel', ['OT2'])
 @pytest.mark.parametrize('shape', [(70, 80)])
-def test_gradientJ(shape, time_order, space_order):
+def test_gradientJ(shape, kernel, space_order):
     """
     This test ensure that the Jacobian computed with devito
     satisfies the Taylor expansion property:
@@ -97,13 +101,16 @@ def test_gradientJ(shape, time_order, space_order):
     :return: assertion that the Taylor properties are satisfied
     """
     spacing = tuple(15. for _ in shape)
-    wave = setup(shape=shape, spacing=spacing,
-                 time_order=time_order, space_order=space_order,
+    wave = setup(shape=shape, spacing=spacing, dtype=np.float64,
+                 kernel=kernel, space_order=space_order,
                  tn=1000., nbpml=10+space_order/2)
-    m0 = smooth10(wave.model.m.data, wave.model.shape_domain)
-    dm = np.float32(wave.model.m.data - m0)
+
+    m0 = Function(name='m0', grid=wave.model.m.grid, space_order=space_order)
+    m0.data[:] = smooth10(wave.model.m.data, wave.model.shape_domain)
+    dm = np.float64(wave.model.m.data - m0.data)
     linrec = Receiver(name='rec', grid=wave.model.grid, ntime=wave.receiver.nt,
                       coordinates=wave.receiver.coordinates.data)
+
     # Compute receiver data and full wavefield for the smooth velocity
     rec, u0, _ = wave.forward(m=m0, save=False)
     # Gradient: J dm
@@ -114,7 +121,10 @@ def test_gradientJ(shape, time_order, space_order):
     error2 = np.zeros(7)
     for i in range(0, 7):
         # Add the perturbation to the model
-        mloc = m0 + H[i] * dm
+        def initializer(data):
+            data[:] = m0.data + H[i] * dm
+        mloc = Function(name='mloc', grid=wave.model.m.grid, space_order=space_order,
+                        initializer=initializer)
         # Data for the new model
         d = wave.forward(m=mloc)[0]
         # First order error F(m0 + hdm) - F(m0)
@@ -133,4 +143,4 @@ def test_gradientJ(shape, time_order, space_order):
 
 
 if __name__ == "__main__":
-    test_gradientJ(shape=(60, 70), time_order=2, space_order=4)
+    test_gradientFWI(shape=(60, 70), kernel='OT2', space_order=4)

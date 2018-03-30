@@ -1,20 +1,21 @@
 import numpy as np
 import os
 import ctypes
-from collections import Callable, Iterable, OrderedDict, Hashable
-from functools import partial, wraps
-from itertools import product
-from subprocess import PIPE, Popen
+import inspect
+from collections import Callable, Iterable, OrderedDict, Hashable, Mapping
+from functools import partial, wraps, reduce
+from itertools import chain, combinations, product, zip_longest
+from operator import attrgetter
+from subprocess import DEVNULL, PIPE, Popen, CalledProcessError, check_output
 import cpuinfo
-try:
-    from itertools import izip_longest as zip_longest
-except ImportError:
-    # Python3.5 compatibility
-    from itertools import zip_longest
+from distutils import version
 
+from multidict import MultiDict
+
+from devito.logger import error
 from devito.parameters import configuration
 
-__all__ = ['memoized', 'infer_cpu', 'sweep', 'silencio']
+__all__ = ['memoized_func', 'memoized_meth', 'infer_cpu', 'sweep', 'silencio']
 
 
 def as_tuple(item, type=None, length=None):
@@ -49,6 +50,19 @@ def is_integer(value):
     return isinstance(value, int) or isinstance(value, np.integer)
 
 
+def generator():
+    """
+    Return a function ``f`` that generates integer numbers starting at 0
+    with stepping 1.
+    """
+    def f():
+        ret = f.counter
+        f.counter += 1
+        return ret
+    f.counter = 0
+    return f
+
+
 def grouper(iterable, n):
     """Split an interable into groups of size n, plus a reminder"""
     args = [iter(iterable)] * n
@@ -58,6 +72,12 @@ def grouper(iterable, n):
 def roundm(x, y):
     """Return x rounded up to the closest multiple of y."""
     return x if x % y == 0 else x + y - x % y
+
+
+def powerset(iterable):
+    "powerset([1,2,3]) --> () (1,) (2,) (3,) (1,2) (1,3) (2,3) (1,2,3)"
+    s = list(iterable)
+    return chain.from_iterable(combinations(s, r) for r in range(len(s)+1))
 
 
 def invert(mapper):
@@ -102,7 +122,10 @@ def filter_ordered(elements, key=None):
 
 
 def filter_sorted(elements, key=None):
-    """Filter elements in a list and sort them by key"""
+    """Filter elements in a list and sort them by key. The default key is
+    ``operator.attrgetter('name')``."""
+    if key is None:
+        key = attrgetter('name')
     return sorted(filter_ordered(elements, key=key), key=key)
 
 
@@ -235,11 +258,13 @@ class change_directory(object):
         os.chdir(self.savedPath)
 
 
-class memoized(object):
+class memoized_func(object):
     """
     Decorator. Caches a function's return value each time it is called.
     If called later with the same arguments, the cached value is returned
-    (not reevaluated).
+    (not reevaluated). This decorator may also be used on class methods,
+    but it will cache at the class level; to cache at the instance level,
+    use ``memoized_meth``.
 
     Adapted from: ::
 
@@ -271,8 +296,53 @@ class memoized(object):
         return partial(self.__call__, obj)
 
 
-default_isa = 'cpp'
-default_platform = 'intel64'
+class memoized_meth(object):
+    """
+    Decorator. Cache the return value of a class method.
+
+    Unlike ``memoized_func``, the return value of a given method invocation
+    will be cached on the instance whose method was invoked. All arguments
+    passed to a method decorated with memoize must be hashable.
+
+    If a memoized method is invoked directly on its class the result will not
+    be cached. Instead the method will be invoked like a static method: ::
+
+        class Obj(object):
+            @memoize
+            def add_to(self, arg):
+                return self + arg
+        Obj.add_to(1) # not enough arguments
+        Obj.add_to(1, 2) # returns 3, result is not cached
+
+    Adapted from: ::
+
+        code.activestate.com/recipes/577452-a-memoize-decorator-for-instance-methods/
+    """
+
+    def __init__(self, func):
+        self.func = func
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self.func
+        return partial(self, obj)
+
+    def __call__(self, *args, **kw):
+        if not isinstance(args, Hashable):
+            # Uncacheable, a list, for instance.
+            # Better to not cache than blow up.
+            return self.func(*args)
+        obj = args[0]
+        try:
+            cache = obj.__cache
+        except AttributeError:
+            cache = obj.__cache = {}
+        key = (self.func, args[1:], frozenset(kw.items()))
+        try:
+            res = cache[key]
+        except KeyError:
+            res = cache[key] = self.func(*args, **kw)
+        return res
 
 
 def infer_cpu():
@@ -283,9 +353,11 @@ def infer_cpu():
     """
     info = cpuinfo.get_cpu_info()
     # ISA
-    isa = default_isa
+    isa = configuration._defaults['isa']
     for i in reversed(configuration._accepted['isa']):
-        if i in info['flags']:
+        if any(j.startswith(i) for j in info['flags']):
+            # Using `startswith`, rather than `==`, as a flag such as 'avx512'
+            # appears as 'avx512f, avx512cd, ...'
             isa = i
             break
     # Platform
@@ -296,18 +368,69 @@ def infer_cpu():
         p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
         output, _ = p2.communicate()
         platform = output.decode("utf-8").split()[1]
+        # Full list of possible /platform/ values at this point at:
+        # https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html
+        platform = {'sandybridge': 'snb', 'ivybridge': 'ivb', 'haswell': 'hsw',
+                    'broadwell': 'bdw', 'skylake': 'skx', 'knl': 'knl'}[platform]
     except:
         # Then, try infer from the brand name, otherwise fallback to default
         try:
-            mapper = {'v3': 'haswell', 'v4': 'broadwell', 'v5': 'skylake'}
-            cpu_iteration = info['brand'].split()[4]
-            platform = mapper[cpu_iteration]
+            platform = info['brand'].split()[4]
+            platform = {'v2': 'ivb', 'v3': 'hsw', 'v4': 'bdw', 'v5': 'skx'}[platform]
         except:
             platform = None
     # Is it a known platform?
     if platform not in configuration._accepted['platform']:
-        platform = default_platform
+        platform = configuration._defaults['platform']
     return isa, platform
+
+
+def sniff_compiler_version(cc):
+    """
+    Try to detect the compiler version.
+
+    Adapted from: ::
+
+        https://github.com/OP2/PyOP2/
+    """
+    try:
+        ver = check_output([cc, "--version"]).decode("utf-8")
+    except (CalledProcessError, UnicodeDecodeError):
+        return version.LooseVersion("unknown")
+
+    if ver.startswith("gcc"):
+        compiler = "gcc"
+    elif ver.startswith("clang"):
+        compiler = "clang"
+    elif ver.startswith("Apple LLVM"):
+        compiler = "clang"
+    elif ver.startswith("icc"):
+        compiler = "icc"
+    else:
+        compiler = "unknown"
+
+    ver = version.LooseVersion("unknown")
+    if compiler in ["gcc", "icc"]:
+        try:
+            # gcc-7 series only spits out patch level on dumpfullversion.
+            ver = check_output([cc, "-dumpfullversion"], stderr=DEVNULL).decode("utf-8")
+            ver = version.StrictVersion(ver.strip())
+        except CalledProcessError:
+            try:
+                ver = check_output([cc, "-dumpversion"], stderr=DEVNULL).decode("utf-8")
+                ver = version.StrictVersion(ver.strip())
+            except (CalledProcessError, UnicodeDecodeError):
+                pass
+        except UnicodeDecodeError:
+            pass
+
+    # Pure integer versions (e.g., ggc5, rather than gcc5.0) need special handling
+    try:
+        ver = version.StrictVersion(float(ver))
+    except TypeError:
+        pass
+
+    return ver
 
 
 class silencio(object):
@@ -341,3 +464,201 @@ def sweep(parameters, keys=None):
                     for v in sweep_values]
     for vals in product(*sweep_values):
         yield dict(zip(keys, vals))
+
+
+class GenericVisitor(object):
+
+    """
+    A generic visitor.
+
+    To define handlers, subclasses should define :data:`visit_Foo`
+    methods for each class :data:`Foo` they want to handle.
+    If a specific method for a class :data:`Foo` is not found, the MRO
+    of the class is walked in order until a matching method is found.
+
+    The method signature is:
+
+        .. code-block::
+           def visit_Foo(self, o, [*args, **kwargs]):
+               pass
+
+    The handler is responsible for visiting the children (if any) of
+    the node :data:`o`.  :data:`*args` and :data:`**kwargs` may be
+    used to pass information up and down the call stack.  You can also
+    pass named keyword arguments, e.g.:
+
+        .. code-block::
+           def visit_Foo(self, o, parent=None, *args, **kwargs):
+               pass
+    """
+
+    def __init__(self):
+        handlers = {}
+        # visit methods are spelt visit_Foo.
+        prefix = "visit_"
+        # Inspect the methods on this instance to find out which
+        # handlers are defined.
+        for (name, meth) in inspect.getmembers(self, predicate=inspect.ismethod):
+            if not name.startswith(prefix):
+                continue
+            # Check the argument specification
+            # Valid options are:
+            #    visit_Foo(self, o, [*args, **kwargs])
+            argspec = inspect.getargspec(meth)
+            if len(argspec.args) < 2:
+                raise RuntimeError("Visit method signature must be "
+                                   "visit_Foo(self, o, [*args, **kwargs])")
+            handlers[name[len(prefix):]] = meth
+        self._handlers = handlers
+
+    """
+    :attr:`default_args`. A dict of default keyword arguments for the visitor.
+    These are not used by default in :meth:`visit`, however, a caller may pass
+    them explicitly to :meth:`visit` by accessing :attr:`default_args`.
+    For example::
+
+        .. code-block::
+           v = FooVisitor()
+           v.visit(node, **v.default_args)
+    """
+    default_args = {}
+
+    @classmethod
+    def default_retval(cls):
+        """A method that returns an object to use to populate return values.
+
+        If your visitor combines values in a tree-walk, it may be useful to
+        provide a object to combine the results into. :meth:`default_retval`
+        may be defined by the visitor to be called to provide an empty object
+        of appropriate type.
+        """
+        return None
+
+    def lookup_method(self, instance):
+        """Look up a handler method for a visitee.
+
+        :param instance: The instance to look up a method for.
+        """
+        cls = instance.__class__
+        try:
+            # Do we have a method handler defined for this type name
+            return self._handlers[cls.__name__]
+        except KeyError:
+            # No, walk the MRO.
+            for klass in cls.mro()[1:]:
+                entry = self._handlers.get(klass.__name__)
+                if entry:
+                    # Save it on this type name for faster lookup next time
+                    self._handlers[cls.__name__] = entry
+                    return entry
+        raise RuntimeError("No handler found for class %s", cls.__name__)
+
+    def visit(self, o, *args, **kwargs):
+        """Apply this :class:`Visitor` to an AST.
+
+            :param o: The :class:`Node` to visit.
+            :param args: Optional arguments to pass to the visit methods.
+            :param kwargs: Optional keyword arguments to pass to the visit methods.
+        """
+        meth = self.lookup_method(o)
+        return meth(o, *args, **kwargs)
+
+    def visit_object(self, o, **kwargs):
+        return self.default_retval()
+
+
+class Bunch(object):
+    """
+    Bind together an arbitrary number of generic items. This is a mutable
+    alternative to a ``namedtuple``.
+
+    From: ::
+
+        http://code.activestate.com/recipes/52308-the-simple-but-handy-collector-of\
+        -a-bunch-of-named/?in=user-97991
+    """
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class EnrichedTuple(tuple):
+    """
+    A tuple with an arbitrary number of additional attributes.
+    """
+    def __new__(cls, *items, getters=None, **kwargs):
+        obj = super(EnrichedTuple, cls).__new__(cls, items)
+        obj.__dict__.update(kwargs)
+        obj._getters = dict(zip(getters or [], items))
+        return obj
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return super(EnrichedTuple, self).__getitem__(key)
+        else:
+            return self._getters[key]
+
+
+class ReducerMap(MultiDict):
+    """
+    Specialised :class:`MultiDict` object that maps a single key to a
+    list of potential values and provides a reduction method for
+    retrieval.
+    """
+
+    def update(self, values):
+        """
+        Update internal mapping with standard dictionary semantics.
+        """
+        if isinstance(values, Mapping):
+            self.extend(values)
+        elif isinstance(values, Iterable) and not isinstance(values, str):
+            for v in values:
+                self.extend(v)
+        else:
+            self.extend(values)
+
+    def unique(self, key):
+        """
+        Returns a unique value for a given key, if such a value
+        exists, and raises a ``ValueError`` if it does not.
+
+        :param key: Key for which to retrieve a unique value
+        """
+        candidates = self.getall(key)
+
+        def compare_to_first(v):
+            first = candidates[0]
+            if isinstance(first, np.ndarray) or isinstance(v, np.ndarray):
+                return (first == v).all()
+            else:
+                return first == v
+
+        if len(candidates) == 1:
+            return candidates[0]
+        elif all(map(compare_to_first, candidates)):
+            return candidates[0]
+        else:
+            error("Unable to find unique value for key %s, candidates: %s" %
+                  (key, candidates))
+            raise ValueError('Inconsistent values for key reduction')
+
+    def reduce(self, key, op=None):
+        """
+        Returns a reduction of all candidate values for a given key.
+
+        :param key: Key for which to retrieve candidate values
+        :param op: Operator for reduction among candidate values.
+                   If not provided, a unique value will be returned,
+                   or a ``ValueError`` raised if no unique value exists.
+        """
+        if op is None:
+            # Return a unique value if it exists
+            return self.unique(key)
+        else:
+            return reduce(op, self.getall(key))
+
+    def reduce_all(self):
+        """
+        Returns a dictionary with reduced/unique values for all keys.
+        """
+        return {k: self.reduce(key=k) for k in self}

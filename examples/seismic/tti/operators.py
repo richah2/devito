@@ -100,7 +100,7 @@ def Gyy_shifted(field, cosphi, sinphi, space_order):
     return -.5 * (Gyy + Gyy2)
 
 
-def Gzz_shited(field, costheta, sintheta, cosphi, sinphi, space_order):
+def Gzz_shifted(field, costheta, sintheta, cosphi, sinphi, space_order):
     """
     3D rotated second order derivative in the direction z as an average of
     two non-centered rotated second order derivative in the direction z
@@ -138,7 +138,7 @@ def Gzz_shited(field, costheta, sintheta, cosphi, sinphi, space_order):
     return -.5 * (Gzz + Gzz2)
 
 
-def Gzz_shited_2d(field, costheta, sintheta, space_order):
+def Gzz_shifted_2d(field, costheta, sintheta, space_order):
     """
     2D rotated second order derivative in the direction z as an average of
     two non-centered rotated second order derivative in the direction z
@@ -256,7 +256,7 @@ def Gxx_centered_2d(field, costheta, sintheta, space_order):
     return field.laplace - Gzz_centered_2d(field, costheta, sintheta, space_order)
 
 
-def kernel_shited_2d(u, v, costheta, sintheta, cosphi, sinphi, space_order):
+def kernel_shifted_2d(u, v, costheta, sintheta, cosphi, sinphi, space_order):
     """
     TTI finite difference kernel. The equation we solve is:
 
@@ -277,11 +277,11 @@ def kernel_shited_2d(u, v, costheta, sintheta, cosphi, sinphi, space_order):
     :return: u and v component of the rotated Laplacian in 2D
     """
     Gxx = Gxx_shifted_2d(u, costheta, sintheta, space_order)
-    Gzz = Gzz_shited_2d(v, costheta, sintheta, space_order)
+    Gzz = Gzz_shifted_2d(v, costheta, sintheta, space_order)
     return Gxx, Gzz
 
 
-def kernel_shited_3d(u, v, costheta, sintheta, cosphi, sinphi, space_order):
+def kernel_shifted_3d(u, v, costheta, sintheta, cosphi, sinphi, space_order):
     """
     TTI finite difference kernel. The equation we solve is:
 
@@ -303,7 +303,7 @@ def kernel_shited_3d(u, v, costheta, sintheta, cosphi, sinphi, space_order):
     """
     Gxx = Gxx_shifted(u, costheta, sintheta, cosphi, sinphi, space_order)
     Gyy = Gyy_shifted(u, cosphi, sinphi, space_order)
-    Gzz = Gzz_shited(v, costheta, sintheta, cosphi, sinphi, space_order)
+    Gzz = Gzz_shifted(v, costheta, sintheta, cosphi, sinphi, space_order)
     return Gxx + Gyy, Gzz
 
 
@@ -357,7 +357,7 @@ def kernel_centered_3d(u, v, costheta, sintheta, cosphi, sinphi, space_order):
     return Gxx, Gzz
 
 
-def ForwardOperator(model, source, receiver, time_order=2, space_order=4,
+def ForwardOperator(model, source, receiver, space_order=4,
                     save=False, kernel='centered', **kwargs):
     """
        Constructor method for the forward modelling operator in an acoustic media
@@ -368,18 +368,18 @@ def ForwardOperator(model, source, receiver, time_order=2, space_order=4,
        :param: time_order: Time discretization order
        :param: spc_order: Space discretization order
        """
-    dt = model.critical_dt
+    dt = model.grid.time_dim.spacing
 
     m, damp, epsilon, delta, theta, phi = (model.m, model.damp, model.epsilon,
                                            model.delta, model.theta, model.phi)
 
     # Create symbols for forward wavefield, source and receivers
     u = TimeFunction(name='u', grid=model.grid,
-                     save=save, time_dim=source.nt if save else None,
-                     time_order=time_order, space_order=space_order)
+                     save=source.nt if save else None,
+                     time_order=2, space_order=space_order)
     v = TimeFunction(name='v', grid=model.grid,
-                     save=save, time_dim=source.nt if save else None,
-                     time_order=time_order, space_order=space_order)
+                     save=source.nt if save else None,
+                     time_order=2, space_order=space_order)
     src = PointSource(name='src', grid=model.grid, ntime=source.nt,
                       npoint=source.npoint)
     rec = Receiver(name='rec', grid=model.grid, ntime=receiver.nt,
@@ -420,5 +420,5 @@ def ForwardOperator(model, source, receiver, time_order=2, space_order=4,
     return Operator(stencils, subs=model.spacing_map, name='ForwardTTI', **kwargs)
 
 
-kernels = {('shifted', 3): kernel_shited_3d, ('shifted', 2): kernel_shited_2d,
+kernels = {('shifted', 3): kernel_shifted_3d, ('shifted', 2): kernel_shifted_2d,
            ('centered', 3): kernel_centered_3d, ('centered', 2): kernel_centered_2d}

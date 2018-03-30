@@ -2,7 +2,7 @@ from collections import OrderedDict
 
 from sympy import collect, collect_const
 
-from devito.ir.dfg import TemporariesGraph
+from devito.ir import FlowGraph
 from devito.symbolics import Eq, count, estimate_cost, q_op, q_leaf, xreplace_constrained
 from devito.types import Indexed, Array
 from devito.tools import flatten
@@ -18,9 +18,8 @@ def promote_scalar_expressions(exprs, shape, indices, onstack):
     processed = []
 
     # Fist promote the LHS
-    graph = TemporariesGraph(exprs)
     mapper = {}
-    for k, v in graph.items():
+    for k, v in FlowGraph(exprs).items():
         if v.is_scalar:
             # Create a new function symbol
             data = Array(name=k.name, shape=shape,
@@ -70,6 +69,9 @@ def collect_nested(expr, aggressive=False):
             rebuilt, candidates = zip(*[run(arg) for arg in expr.args])
             rebuilt = collect_const(expr.func(*rebuilt))
             return rebuilt, flatten(candidates)
+        elif expr.is_Equality:
+            rebuilt, candidates = zip(*[run(expr.lhs), run(expr.rhs)])
+            return expr.func(*rebuilt, evaluate=False), flatten(candidates)
         else:
             rebuilt, candidates = zip(*[run(arg) for arg in expr.args])
             return expr.func(*rebuilt), flatten(candidates)
@@ -85,8 +87,6 @@ def common_subexprs_elimination(exprs, make, mode='default'):
 
     :param exprs: The target SymPy expression, or a collection of SymPy expressions.
     :param make: A function to construct symbols used for replacement.
-                 The function takes as input an integer ID; ID is computed internally
-                 and used as a unique identifier for the constructed symbols.
     """
 
     # Note: not defaulting to SymPy's CSE() function for three reasons:
@@ -109,9 +109,9 @@ def common_subexprs_elimination(exprs, make, mode='default'):
         # Create temporaries
         hit = max(targets.values())
         picked = [k for k, v in targets.items() if v == hit]
-        mapper = OrderedDict([(e, make(len(mapped) + i)) for i, e in enumerate(picked)])
+        mapper = OrderedDict([(e, make()) for i, e in enumerate(picked)])
 
-        # Apply repleacements
+        # Apply replacements
         processed = [e.xreplace(mapper) for e in processed]
         mapped = [e.xreplace(mapper) for e in mapped]
         mapped = [Eq(v, k) for k, v in reversed(list(mapper.items()))] + mapped
@@ -135,7 +135,7 @@ def compact_temporaries(temporaries, leaves):
     exprs = temporaries + leaves
     targets = {i.lhs for i in leaves}
 
-    g = TemporariesGraph(exprs)
+    g = FlowGraph(exprs)
 
     mapper = {k: v.rhs for k, v in g.items()
               if v.is_scalar and

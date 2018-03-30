@@ -20,7 +20,8 @@ def test_acousticJ(shape, space_order):
 
     # Create two-layer "true" model from preset with a fault 1/3 way down
     model = demo_model('layers-isotropic', ratio=3, vp_top=1.5, vp_bottom=2.5,
-                       spacing=spacing, shape=shape, nbpml=nbpml)
+                       spacing=spacing, space_order=space_order, shape=shape,
+                       nbpml=nbpml, dtype=np.float64)
 
     # Derive timestepping from model spacing
     dt = model.critical_dt
@@ -39,17 +40,19 @@ def test_acousticJ(shape, space_order):
 
     # Create solver object to provide relevant operators
     solver = AcousticWaveSolver(model, source=src, receiver=rec,
-                                time_order=2, space_order=space_order)
+                                kernel='OT2', space_order=space_order)
 
     # Create initial model (m0) with a constant velocity throughout
     model0 = demo_model('layers-isotropic', ratio=3, vp_top=1.5, vp_bottom=1.5,
-                        spacing=spacing, shape=shape, nbpml=nbpml)
+                        spacing=spacing, space_order=space_order, shape=shape,
+                        nbpml=nbpml, dtype=np.float64)
 
     # Compute the full wavefield u0
     _, u0, _ = solver.forward(save=True, m=model0.m)
 
     # Compute initial born perturbation from m - m0
     dm = model.m.data - model0.m.data
+
     du, _, _, _ = solver.born(dm, m=model0.m)
 
     # Compute gradientfrom initial perturbation

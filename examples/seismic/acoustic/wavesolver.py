@@ -1,4 +1,4 @@
-from devito import Function, TimeFunction, memoized
+from devito import Function, TimeFunction, memoized_meth
 from examples.seismic import PointSource, Receiver
 from examples.seismic.acoustic.operators import (
     ForwardOperator, AdjointOperator, GradientOperator, BornOperator
@@ -25,52 +25,51 @@ class AcousticWaveSolver(object):
 
     Note: space_order must always be greater than time_order
     """
-    def __init__(self, model, source, receiver,
-                 time_order=2, space_order=2, **kwargs):
+    def __init__(self, model, source, receiver, kernel='OT2', space_order=2, **kwargs):
         self.model = model
         self.source = source
         self.receiver = receiver
 
-        self.time_order = time_order
         self.space_order = space_order
+        self.kernel = kernel
 
         # Time step can be \sqrt{3}=1.73 bigger with 4th order
         self.dt = self.model.critical_dt
-        if self.time_order == 4:
+        if self.kernel == 'OT4':
             self.dt *= 1.73
 
         # Cache compiler options
         self._kwargs = kwargs
 
-    @memoized
-    def op_fwd(self, save=False):
+    @memoized_meth
+    def op_fwd(self, save=None):
         """Cached operator for forward runs with buffered wavefield"""
         return ForwardOperator(self.model, save=save, source=self.source,
-                               receiver=self.receiver, time_order=self.time_order,
+                               receiver=self.receiver, kernel=self.kernel,
                                space_order=self.space_order, **self._kwargs)
 
-    @memoized
+    @memoized_meth
     def op_adj(self):
         """Cached operator for adjoint runs"""
-        return AdjointOperator(self.model, save=False, source=self.source,
-                               receiver=self.receiver, time_order=self.time_order,
+        return AdjointOperator(self.model, save=None, source=self.source,
+                               receiver=self.receiver, kernel=self.kernel,
                                space_order=self.space_order, **self._kwargs)
 
-    @memoized
+    @memoized_meth
     def op_grad(self):
         """Cached operator for gradient runs"""
         return GradientOperator(self.model, save=True, source=self.source,
-                                receiver=self.receiver, time_order=self.time_order,
+                                receiver=self.receiver, kernel=self.kernel,
                                 space_order=self.space_order, **self._kwargs)
 
-    @memoized
+    @memoized_meth
     def op_born(self):
         """Cached operator for born runs"""
-        return BornOperator(self.model, save=False, source=self.source,
-                            receiver=self.receiver, time_order=self.time_order,
+        return BornOperator(self.model, save=None, source=self.source,
+                            receiver=self.receiver, kernel=self.kernel,
                             space_order=self.space_order, **self._kwargs)
 
-    def forward(self, src=None, rec=None, u=None, m=None, save=False, **kwargs):
+    def forward(self, src=None, rec=None, u=None, m=None, save=None, **kwargs):
         """
         Forward modelling function that creates the necessary
         data objects for running a forward modelling operator.
@@ -104,7 +103,7 @@ class AcousticWaveSolver(object):
 
         # Execute operator and return wavefield and receiver data
         summary = self.op_fwd(save).apply(src=src, rec=rec, u=u, m=m,
-                                          dt=self.dt, **kwargs)
+                                          dt=kwargs.pop('dt', self.dt), **kwargs)
         return rec, u, summary
 
     def adjoint(self, rec, srca=None, v=None, m=None, **kwargs):
@@ -129,7 +128,7 @@ class AcousticWaveSolver(object):
 
         # Create the adjoint wavefield if not provided
         if v is None:
-            v = TimeFunction(name='v', grid=self.model.grid, save=None,
+            v = TimeFunction(name='v', grid=self.model.grid,
                              time_order=2, space_order=self.space_order)
 
         # Pick m from model unless explicitly provided
@@ -138,7 +137,7 @@ class AcousticWaveSolver(object):
 
         # Execute operator and return wavefield and receiver data
         summary = self.op_adj().apply(srca=srca, rec=rec, v=v, m=m,
-                                      dt=self.dt, **kwargs)
+                                      dt=kwargs.pop('dt', self.dt), **kwargs)
         return srca, v, summary
 
     def gradient(self, rec, u, v=None, grad=None, m=None, **kwargs):
@@ -161,7 +160,7 @@ class AcousticWaveSolver(object):
 
         # Create the forward wavefield
         if v is None:
-            v = TimeFunction(name='v', grid=self.model.grid, save=None,
+            v = TimeFunction(name='v', grid=self.model.grid,
                              time_order=2, space_order=self.space_order)
 
         # Pick m from model unless explicitly provided
@@ -169,7 +168,7 @@ class AcousticWaveSolver(object):
             m = m or self.model.m
 
         summary = self.op_grad().apply(rec=rec, grad=grad, v=v, u=u, m=m,
-                                       dt=self.dt, **kwargs)
+                                       dt=kwargs.pop('dt', self.dt), **kwargs)
         return grad, summary
 
     def born(self, dmin, src=None, rec=None, u=None, U=None, m=None, **kwargs):
@@ -194,10 +193,10 @@ class AcousticWaveSolver(object):
 
         # Create the forward wavefields u and U if not provided
         if u is None:
-            u = TimeFunction(name='u', grid=self.model.grid, save=False,
+            u = TimeFunction(name='u', grid=self.model.grid,
                              time_order=2, space_order=self.space_order)
         if U is None:
-            U = TimeFunction(name='U', grid=self.model.grid, save=False,
+            U = TimeFunction(name='U', grid=self.model.grid,
                              time_order=2, space_order=self.space_order)
 
         # Pick m from model unless explicitly provided
@@ -206,5 +205,5 @@ class AcousticWaveSolver(object):
 
         # Execute operator and return wavefield and receiver data
         summary = self.op_born().apply(dm=dmin, u=u, U=U, src=src, rec=rec,
-                                       m=m, dt=self.dt, **kwargs)
+                                       m=m, dt=kwargs.pop('dt', self.dt), **kwargs)
         return rec, u, U, summary

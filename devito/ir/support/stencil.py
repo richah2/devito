@@ -1,11 +1,8 @@
-from collections import OrderedDict, namedtuple
+from collections import namedtuple
 
-from sympy import Eq
+from devito.tools import DefaultOrderedDict
 
-from devito.exceptions import StencilOperationError
-from devito.dimension import Dimension
-from devito.symbolics import retrieve_indexed, retrieve_terminals
-from devito.tools import DefaultOrderedDict, flatten, partial_order
+__all__ = ['Stencil']
 
 
 class Stencil(DefaultOrderedDict):
@@ -22,78 +19,24 @@ class Stencil(DefaultOrderedDict):
     Note: Expressions must have been indexified for a Stencil to be computed.
     """
 
-    def __init__(self, *args):
+    def __init__(self, entries=None):
         """
         Initialize the Stencil.
 
-        :param args: A Stencil may be created in several ways: ::
-
-            * From a SymPy equation, or
-            * A list of elements of type: ::
-                * SymPy equation, or
-                * StencilEntry, or
-                * 2-tuple (Dimension, set) -- raw initialization
+        :param entries: An iterable of :class:`StencilEntry` or a 2-tuple
+                        convertible into a :class:`StencilEntry` (i.e., a
+                        :class:`Dimension` and a set).
         """
         processed = []
-        for i in args:
-            if isinstance(i, Eq):
-                processed.extend(self.extract(i).items())
+        for i in (entries or []):
+            if isinstance(i, StencilEntry):
+                processed.append((i.dim, i.ofs))
+            elif isinstance(i, tuple) and len(i) == 2:
+                entry = StencilEntry(*i)  # Type checking
+                processed.append((entry.dim, entry.ofs))
             else:
-                for j in i:
-                    if isinstance(j, StencilEntry):
-                        processed.append((j.dim, set(j.ofs)))
-                    elif isinstance(j, tuple) and len(j) == 2:
-                        entry = StencilEntry(*j)  # Type checking
-                        processed.append((entry.dim, set(entry.ofs)))
-                    else:
-                        raise RuntimeError('Cannot construct a Stencil for %s' % str(j))
+                raise TypeError('Cannot construct a Stencil for %s' % str(i))
         super(Stencil, self).__init__(set, processed)
-
-    @classmethod
-    def extract(cls, expr):
-        """
-        Compute the stencil of ``expr``.
-        """
-        assert expr.is_Equality
-
-        # Collect all indexed objects appearing in /expr/
-        terminals = retrieve_terminals(expr, mode='all')
-        indexeds = [i for i in terminals if i.is_Indexed]
-        indexeds += flatten([retrieve_indexed(i) for i in e.indices] for e in indexeds)
-
-        # Enforce deterministic dimension ordering...
-        dims = OrderedDict()
-        for e in terminals:
-            if isinstance(e, Dimension):
-                dims[(e,)] = e
-            elif e.is_Indexed:
-                d = []
-                for a in e.indices:
-                    found = [i for i in a.free_symbols if isinstance(i, Dimension)]
-                    d.extend([i for i in found if i not in d])
-                dims[tuple(d)] = e
-        # ... giving higher priority to TimeFunction objects; time always go first
-        dims = sorted(list(dims),
-                      key=lambda i: not (isinstance(dims[i], Dimension) or
-                                         dims[i].base.function.is_TimeFunction))
-        stencil = Stencil([(i, set()) for i in partial_order(dims)])
-
-        # Determine the points accessed along each dimension
-        for e in indexeds:
-            for a in e.indices:
-                if isinstance(a, Dimension):
-                    stencil[a].update([0])
-                d = None
-                off = [0]
-                for i in a.args:
-                    if isinstance(i, Dimension):
-                        d = i
-                    elif i.is_integer:
-                        off += [i]
-                if d is not None:
-                    stencil[d].update(off)
-
-        return stencil
 
     @classmethod
     def union(cls, *dicts):
@@ -105,10 +48,6 @@ class Stencil(DefaultOrderedDict):
             for k, v in i.items():
                 output[k] |= v
         return output
-
-    @property
-    def frozen(self):
-        return Stencil([(k, frozenset(v)) for k, v in self.items()])
 
     @property
     def empty(self):
@@ -125,28 +64,6 @@ class Stencil(DefaultOrderedDict):
     @property
     def diameter(self):
         return {k: abs(max(v) - min(v)) for k, v in self.items()}
-
-    def null(self):
-        """
-        Return the null Stencil of ``self``.
-
-        Examples:
-
-        self = {i: {-1, 0, 1}, j: {-2, -1, 0, 1, 2}}
-        self.null() >> {i: {0}, j: {0}}
-        """
-        return Stencil([(i, set([0])) for i in self.dimensions])
-
-    def section(self, d):
-        """
-        Return a view of the Stencil in which the Dimensions in ``d`` have been
-        dropped.
-        """
-        output = Stencil()
-        for k, v in self.items():
-            if k not in d:
-                output[k] = set(v)
-        return output
 
     def subtract(self, o):
         """
@@ -172,61 +89,12 @@ class Stencil(DefaultOrderedDict):
                 output[k] |= o[k]
         return output
 
-    def rshift(self, m):
-        """
-        Right-shift the Dimensions ``d`` of ``self`` appearing in the mapper ``m``
-        by the constant quantity ``m[d]``.
-        """
-        return Stencil([(k, set([i - m.get(k, 0) for i in v])) for k, v in self.items()])
-
-    def split(self, ds=None):
-        """
-        Split ``self`` into two Stencils, one with the negative axis, and one
-        with the positive axis. If ``ds`` is provided, the split occurs only
-        along the Dimensions listed in ``ds``.
-        """
-        ds = ds or self.dimensions
-        negative, positive = Stencil(), Stencil()
-        for k, v in self.items():
-            if k in ds:
-                negative[k] = {i for i in v if i < 0}
-                positive[k] = {i for i in v if i > 0}
-        return negative, positive
-
-    def anti(self, o):
-        """
-        Compute the anti-Stencil of ``self`` constrained by ``o``.
-
-        Examples:
-
-        Assuming one single dimension (omitted for brevity)
-
-        self = {-3, -2, -1, 0, 1, 2, 3}
-        o = {-3, -2, -1, 0, 1, 2, 3}
-        self.anti(o) >> {}
-
-        self = {-3, -2, -1, 0, 1, 2, 3}
-        o = {-2, -1, 0, 1}
-        self.anti(o) >> {-1, 0, 1, 2}
-
-        self = {-1, 0, 1}
-        o = {-2, -1, 0, 1, 2}
-        self.anti(o) >> {-1, 0, 1}
-        """
-        if any(not o[i].issuperset(self[i]) for i in o.dimensions if i in self):
-            raise StencilOperationError
-
-        diff = o.subtract(self)
-        n, p = diff.split()
-        n = n.rshift({i: min(self[i]) for i in self})
-        p = p.rshift({i: max(self[i]) for i in self})
-        union = Stencil.union(*[n, o.null(), p])
-
-        return union
-
     def get(self, k, v=None):
         obj = super(Stencil, self).get(k, v)
         return frozenset([0]) if obj is None else obj
+
+    def entry(self, k):
+        return StencilEntry(k, self.get(k))
 
     def prefix(self, o):
         """
@@ -246,16 +114,6 @@ class Stencil(DefaultOrderedDict):
         """
         return Stencil(self.entries)
 
-    def replace(self, mapper):
-        """
-        Return a new Stencil in which a key ``k`` (dimension) appearing in
-        ``mapper``  is replaced by ``mapper[k]``. The original order is therefore
-        unchangend, but a new dictionary is produced with potentially different
-        keys.
-        """
-        return Stencil([(k if k not in mapper else mapper[k], set(v))
-                        for k, v in self.items()])
-
     def __eq__(self, other):
         return self.entries == other.entries
 
@@ -268,3 +126,4 @@ class Stencil(DefaultOrderedDict):
 
 
 StencilEntry = namedtuple('StencilEntry', 'dim ofs')
+StencilEntry.copy = lambda i: StencilEntry(i.dim, set(i.ofs))

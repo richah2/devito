@@ -2,7 +2,7 @@ from __future__ import absolute_import
 
 from collections import OrderedDict
 
-from devito.ir import clusterize
+from devito.ir import DataSpace, IterationSpace, Interval, Cluster, ClusterGroup, groupby
 from devito.dse.aliases import collect
 from devito.dse.backends import BasicRewriter, dse_pass
 from devito.symbolics import Eq, estimate_cost, xreplace_constrained, iq_timeinvariant
@@ -14,7 +14,7 @@ from devito.types import Indexed, Scalar, Array
 class AdvancedRewriter(BasicRewriter):
 
     def _pipeline(self, state):
-        self._extract_time_invariants(state)
+        self._extract_time_invariants(state, costmodel=lambda e: e.is_Function)
         self._eliminate_inter_stencil_redundancies(state)
         self._eliminate_intra_stencil_redundancies(state)
         self._factorize(state)
@@ -27,7 +27,7 @@ class AdvancedRewriter(BasicRewriter):
         """
 
         # Extract time invariants
-        make = lambda i: Scalar(name=template(i)).indexify()
+        make = lambda: Scalar(name=template()).indexify()
         rule = iq_timeinvariant(cluster.trace)
         costmodel = costmodel or (lambda e: estimate_cost(e) > 0)
         processed, found = xreplace_constrained(cluster.exprs, make, rule, costmodel)
@@ -36,7 +36,6 @@ class AdvancedRewriter(BasicRewriter):
             leaves = [i for i in processed if i not in found]
 
             # Search for common sub-expressions amongst them (and only them)
-            make = lambda i: Scalar(name=template(i + len(found))).indexify()
             found = common_subexprs_elimination(found, make)
 
             # Some temporaries may be droppable at this point
@@ -112,11 +111,6 @@ class AdvancedRewriter(BasicRewriter):
         indices = g.space_indices
         time_invariants = {v.rhs: g.time_invariant(v) for v in g.values()}
 
-        # Template for captured redundancies
-        shape = tuple(i.symbolic_extent for i in indices)
-        make = lambda i: Array(name=template(i), shape=shape,
-                               dimensions=indices).indexed
-
         # Find the candidate expressions
         processed = []
         candidates = OrderedDict()
@@ -130,33 +124,48 @@ class AdvancedRewriter(BasicRewriter):
             else:
                 processed.append(Eq(k, v.rhs))
 
-        # Create temporaries capturing redundant computation
-        expressions = []
-        stencils = []
+        # Create alias Clusters and all necessary substitution rules
+        # for the new temporaries
+        alias_clusters = ClusterGroup()
         rules = OrderedDict()
-        for c, (origin, alias) in enumerate(aliases.items()):
+        for origin, alias in aliases.items():
             if all(i not in candidates for i in alias.aliased):
                 continue
-            # Build alias expression
-            function = make(c)
-            expressions.append(Eq(Indexed(function, *indices), origin))
-            # Build substitution rules
+            # Construct an iteration space suitable for /alias/
+            intervals, sub_iterators, directions = cluster.ispace.args
+            intervals = [Interval(i.dim, *alias.relaxed_diameter.get(i.dim, i.limits))
+                         for i in cluster.ispace.intervals]
+            ispace = IterationSpace(intervals, sub_iterators, directions)
+
+            # Optimization: perhaps we can lift the cluster outside the time dimension
+            if all(time_invariants[i] for i in alias.aliased):
+                ispace = ispace.project(lambda i: not i.is_Time)
+
+            # Build a symbolic function for /alias/
+            intervals = ispace.intervals
+            shape = tuple(i.symbolic_size for i in indices)
+            halo = [(abs(intervals[i].lower), abs(intervals[i].upper)) for i in indices]
+            function = Array(name=template(), shape=shape, dimensions=indices, halo=halo)
+            access = tuple(i - intervals[i].lower for i in indices)
+            expression = Eq(Indexed(function.indexed, *access), origin)
+
+            # Construct a data space suitable for /alias/
+            data_intervals = [i.zero() for i in intervals]
+            dspace = DataSpace(data_intervals, {function: data_intervals})
+
+            # Create a new Cluster for /alias/
+            alias_clusters.append(Cluster([expression], ispace, dspace))
+
+            # Add substitution rules
             for aliased, distance in alias.with_distance:
-                coordinates = [sum([i, j]) for i, j in distance.items() if i in indices]
-                temporary = Indexed(function, *tuple(coordinates))
+                access = [i - intervals[i].lower + j for i, j in distance if i in indices]
+                temporary = Indexed(function.indexed, *tuple(access))
                 rules[candidates[aliased]] = temporary
                 rules[aliased] = temporary
-            # Build cluster stencil
-            stencil = alias.anti_stencil.anti(cluster.stencil)
-            if all(time_invariants[i] for i in alias.aliased):
-                # Optimization: drop time dimension if time-invariant and the
-                # alias involves a complex calculation
-                stencil = stencil.section(g.time_indices)
-            stencils.append(stencil)
 
-        # Create the alias clusters
-        alias_clusters = clusterize(expressions, stencils)
-        alias_clusters = sorted(alias_clusters, key=lambda i: i.is_dense)
+        # Group clusters together if possible
+        alias_clusters = groupby(alias_clusters).finalize()
+        alias_clusters.sort(key=lambda i: i.is_dense)
 
         # Switch temporaries in the expression trees
         processed = [e.xreplace(rules) for e in processed]
