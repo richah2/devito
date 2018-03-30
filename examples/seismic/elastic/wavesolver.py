@@ -24,7 +24,7 @@ class ElasticWaveSolver(object):
     Note: space_order must always be greater than time_order
     Note2: This is an experimental staggered grid elastic modeling kernel. Only 2D supported
     """
-    def __init__(self, model, source, receiver, kernel='OT2', space_order=2, **kwargs):
+    def __init__(self, model, source, receiver, space_order=4, **kwargs):
         self.model = model
         self.source = source
         self.receiver = receiver
@@ -69,20 +69,20 @@ class ElasticWaveSolver(object):
                        ntime=self.receiver.nt,
                        coordinates=self.receiver.coordinates.data)
         # Create all the fields vx, vz, tau_xx, tau_zz, tau_xz
-        vx = TimeFunction(name='vx', grid=self.model.grid,
-                          save=self.source.nt if save else None,
+        vx = TimeFunction(name='vx', grid=self.model.grid, staggered=(0, 1, 0),
+                          save=source.nt if save else None,
                           time_order=2, space_order=self.space_order)
-        vz = TimeFunction(name='vz', grid=self.model.grid,
-                          save=self.source.nt if save else None,
+        vz = TimeFunction(name='vz', grid=self.model.grid, staggered=(0, 0, 1),
+                          save=source.nt if save else None,
                           time_order=2, space_order=self.space_order)
         txx = TimeFunction(name='txx', grid=self.model.grid,
-                          save=self.source.nt if save else None,
+                          save=source.nt if save else None,
                           time_order=2, space_order=self.space_order)
         tzz = TimeFunction(name='tzz', grid=self.model.grid,
-                          save=self.source.nt if save else None,
+                          save=source.nt if save else None,
                           time_order=2, space_order=self.space_order)
-        txz = TimeFunction(name='txz', grid=self.model.grid,
-                          save=self.source.nt if save else None,
+        txz = TimeFunction(name='txz', grid=self.model.grid, staggered=(0, 1, 1),
+                          save=source.nt if save else None,
                           time_order=2, space_order=self.space_order)
         # Pick m from model unless explicitly provided
         if vp is None:

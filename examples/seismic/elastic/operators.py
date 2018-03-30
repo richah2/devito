@@ -41,10 +41,10 @@ def ForwardOperator(model, source, receiver, space_order=4,
     l = (cp2*ro - 2*mu)
 
     # Create symbols for forward wavefield, source and receivers
-    vx = TimeFunction(name='vx', grid=model.grid,
+    vx = TimeFunction(name='vx', grid=model.grid, staggered=(0, 1, 0),
                       save=source.nt if save else None,
                       time_order=2, space_order=space_order)
-    vz = TimeFunction(name='vz', grid=model.grid,
+    vz = TimeFunction(name='vz', grid=model.grid, staggered=(0, 0, 1),
                       save=source.nt if save else None,
                       time_order=2, space_order=space_order)
     txx = TimeFunction(name='txx', grid=model.grid,
@@ -53,16 +53,17 @@ def ForwardOperator(model, source, receiver, space_order=4,
     tzz = TimeFunction(name='tzz', grid=model.grid,
                       save=source.nt if save else None,
                       time_order=2, space_order=space_order)
-    txz = TimeFunction(name='txz', grid=model.grid,
+    txz = TimeFunction(name='txz', grid=model.grid, staggered=(0, 1, 1),
                       save=source.nt if save else None,
                       time_order=2, space_order=space_order)
+    # Source and receivers
     src = PointSource(name='src', grid=model.grid, ntime=source.nt,
                       npoint=source.npoint)
     rec1 = Receiver(name='rec1', grid=model.grid, ntime=receiver.nt,
                    npoint=receiver.npoint)
     rec2 = Receiver(name='rec2', grid=model.grid, ntime=receiver.nt,
                    npoint=receiver.npoint)
-
+    # Stencils
     u_vx = Eq(vx.forward, vx - s*ro*(staggered_diff(txx, dim=x, order=space_order, stagger=left)
                                     + staggered_diff(txz, dim=z, order=space_order, stagger=right)))
 
@@ -78,8 +79,8 @@ def ForwardOperator(model, source, receiver, space_order=4,
                                          + staggered_diff(vz.forward, dim=x, order=space_order, stagger=left)))
 
     # The source injection term
-    src_xx = src.inject(field=txx.forward, expr=src)
-    src_zz = src.inject(field=tzz.forward, expr=src)
+    src_xx = src.inject(field=txx.forward, expr=src, offset=model.nbpml)
+    src_zz = src.inject(field=tzz.forward, expr=src, offset=model.nbpml)
 
     # Create interpolation expression for receivers
     rec_term1 = rec1.interpolate(expr=vx, offset=model.nbpml)

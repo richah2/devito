@@ -566,5 +566,5 @@ class ModelElastic(object):
         # For a fixed time order this number goes down as the space order increases.
         #
         # The CFL condtion is then given by
-        # dt <= h / (sqrt(max(vp)**2 + max(vs)**2))
-        return self.dtype(np.min(self.spacing) / np.sqrt(np.max(self.vp.data)**2 + np.max(self.vs.data)**2 ))
+        # dt < h / (sqrt(2) * max(vp)))
+        return self.dtype(.8*np.min(self.spacing) / (np.sqrt(2)*np.max(self.vp.data)))

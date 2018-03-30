@@ -11,17 +11,18 @@ def elastic_setup(shape=(50, 50), spacing=(15.0, 15.0),
                    tn=500., space_order=4, nbpml=10,
                    **kwargs):
 
-    shape = (1601, 401)
+    shape = (201, 201)
     spacing = (7.5, 7.5)
     origin = (0., 0.)
-
-    vp = np.fromfile("/nethome/mlouboutin3/Research/datasets/devito_data/Simple2D/vp_marmousi_bi", dtype=np.float32, sep="")
-    vp = np.reshape(vp, shape)
-    # Cut the model to make it slightly cheaper
-    vp = vp[301:-300, :]
-    vs = vp/2
+    #
+    # vp = np.fromfile("/nethome/mlouboutin3/Research/datasets/devito_data/Simple2D/vp_marmousi_bi", dtype=np.float32, sep="")
+    # vp = np.reshape(vp, shape)
+    # # Cut the model to make it slightly cheaper
+    # vp = vp[301:-300, :]
+    # shape = vp.shape
+    vp = 1.500 # * np.ones(shape)
+    vs = vp/2.0
     rho = vp - np.min(vp) + 1.0
-    shape = vp.shape
     nrec = shape[0]
     model = ModelElastic(origin, spacing, shape, space_order, vp, vs, rho)
 
@@ -34,7 +35,7 @@ def elastic_setup(shape=(50, 50), spacing=(15.0, 15.0),
     # Define source geometry (center of domain, just below surface)
     src = RickerSource(name='src', grid=model.grid, f0=0.01, time=time)
     src.coordinates.data[0, :] = np.array(model.domain_size) * .5
-    src.coordinates.data[0, -1] = model.origin[-1] + 2 * spacing[-1]
+    # src.coordinates.data[0, -1] = model.origin[-1] + 2 * spacing[-1]
 
     # Define receiver geometry (spread across x, just below surface)
     rec = Receiver(name='rec', grid=model.grid, ntime=nt, npoint=nrec)
@@ -68,7 +69,7 @@ if __name__ == "__main__":
                         help="Execute all operators and store forward wavefield")
     parser.add_argument('-a', '--autotune', default=False, action='store_true',
                         help="Enable autotuning for block sizes")
-    parser.add_argument("-so", "--space_order", default=6,
+    parser.add_argument("-so", "--space_order", default=4,
                         type=int, help="Space order of the simulation")
     parser.add_argument("--nbpml", default=40,
                         type=int, help="Number of PML layers around the domain")
@@ -84,7 +85,7 @@ if __name__ == "__main__":
     # 3D preset parameters
     shape = (150, 150)
     spacing = (15.0, 15.0)
-    tn = 2000.0
+    tn = 500.0
 
     run(shape=shape, spacing=spacing, nbpml=args.nbpml, tn=tn,
         space_order=args.space_order,
