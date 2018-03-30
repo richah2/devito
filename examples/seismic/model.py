@@ -5,7 +5,7 @@ from devito import Grid, Function, Constant
 from devito.logger import error
 
 
-__all__ = ['Model', 'demo_model']
+__all__ = ['Model', 'ModelElastic', 'demo_model']
 
 
 def demo_model(preset, **kwargs):
@@ -461,3 +461,110 @@ class Model(object):
             initialize_function(self.m, 1 / (self.vp * self.vp), self.nbpml)
         else:
             self.m.data = 1 / vp**2
+
+
+class ModelElastic(object):
+    """The physical model used in seismic inversion processes.
+
+    :param origin: Origin of the model in m as a tuple in (x,y,z) order
+    :param spacing: Grid size in m as a Tuple in (x,y,z) order
+    :param shape: Number of grid points size in (x,y,z) order
+    :param space_order: Order of the spatial stencil discretisation
+    :param vp: Velocity in km/s
+    :param nbpml: The number of PML layers for boundary damping
+    :param rho: Density in kg/cm^3 (rho=1 for water)
+    :param epsilon: Thomsen epsilon parameter (0<epsilon<1)
+    :param delta: Thomsen delta parameter (0<delta<1), delta<epsilon
+    :param theta: Tilt angle in radian
+    :param phi: Asymuth angle in radian
+
+    The :class:`Model` provides two symbolic data objects for the
+    creation of seismic wave propagation operators:
+
+    :param m: The square slowness of the wave
+    :param damp: The damping field for absorbing boundarycondition
+    """
+    def __init__(self, origin, spacing, shape, space_order, vp, vs, rho, nbpml=20,
+                 dtype=np.float32):
+        self.shape = shape
+        self.nbpml = int(nbpml)
+        self.origin = tuple([dtype(o) for o in origin])
+
+        shape_pml = np.array(shape) + 2 * self.nbpml
+        # Physical extent is calculated per cell, so shape - 1
+        extent = tuple(np.array(spacing) * (shape_pml - 1))
+        self.grid = Grid(extent=extent, shape=shape_pml,
+                         origin=origin, dtype=dtype)
+
+        # Create square slowness of the wave as symbol `m`
+        if isinstance(vp, np.ndarray):
+            self.vp = Function(name="vp", grid=self.grid, space_order=space_order)
+            initialize_function(self.vp, vp, self.nbpml)
+        else:
+            self.vp = Constant(name="vp", value=vp)
+
+        # Create square slowness of the wave as symbol `m`
+        if isinstance(vp, np.ndarray):
+            self.vs = Function(name="vs", grid=self.grid, space_order=space_order)
+            initialize_function(self.vs, vs, self.nbpml)
+        else:
+            self.vs = Constant(name="vs", value=vs)
+
+        # Create square slowness of the wave as symbol `m`
+        if isinstance(vp, np.ndarray):
+            self.rho = Function(name="rho", grid=self.grid, space_order=space_order)
+            initialize_function(self.rho, rho, self.nbpml)
+        else:
+            self.rho = Constant(name="rho", value=rho)
+        # Create dampening field as symbol `damp`
+        self.damp = Function(name="damp", grid=self.grid)
+        damp_boundary(self.damp, self.nbpml, spacing=self.spacing)
+
+    @property
+    def dim(self):
+        """
+        Spatial dimension of the problem and model domain.
+        """
+        return self.grid.dim
+
+    @property
+    def spacing(self):
+        """
+        Grid spacing for all fields in the physical model.
+        """
+        return self.grid.spacing
+
+    @property
+    def spacing_map(self):
+        """
+        Map between spacing symbols and their values for each :class:`SpaceDimension`
+        """
+        return self.grid.spacing_map
+
+    @property
+    def dtype(self):
+        """
+        Data type for all assocaited data objects.
+        """
+        return self.grid.dtype
+
+    @property
+    def shape_domain(self):
+        """Computational shape of the model domain, with PML layers"""
+        return tuple(d + 2*self.nbpml for d in self.shape)
+
+    @property
+    def domain_size(self):
+        """
+        Physical size of the domain as determined by shape and spacing
+        """
+        return tuple((d-1) * s for d, s in zip(self.shape, self.spacing))
+
+    @property
+    def critical_dt(self):
+        """Critical computational time step value from the CFL condition."""
+        # For a fixed time order this number goes down as the space order increases.
+        #
+        # The CFL condtion is then given by
+        # dt <= h / (sqrt(max(vp)**2 + max(vs)**2))
+        return self.dtype(np.min(self.spacing) / np.sqrt(np.max(self.vp.data)**2 + np.max(self.vs.data)**2 ))
