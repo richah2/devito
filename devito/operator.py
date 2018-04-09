@@ -183,6 +183,7 @@ class Operator(Callable):
     def arguments(self, **kwargs):
         args = self.prepare_arguments(**kwargs)
         # Check all arguments are present
+        print(args)
         for p in self.parameters:
             if p.name not in args:
                 raise ValueError("No value found for parameter %s" % p.name)

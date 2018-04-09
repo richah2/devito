@@ -2,12 +2,14 @@ import numpy as np
 import pytest
 from conftest import skipif_yask
 from math import sin, floor
+from itertools import product
 
 from devito.cgen_utils import FLOAT
 from devito import Grid, Operator, Function, SparseFunction, Dimension
 from devito.function import PrecomputedSparseFunction
 from examples.seismic import demo_model, RickerSource, Receiver
 from examples.seismic.acoustic import AcousticWaveSolver
+from devito.tools import ReducerMap
 
 
 @pytest.fixture
@@ -100,6 +102,47 @@ def test_precomputed_interpolation():
     op()
     expected_values = [sin(point[0]) + sin(point[1]) for point in points]
     assert(all(np.isclose(sf.data, expected_values, rtol=1e-6)))
+
+
+@skipif_yask
+def test_precomputed_injection():
+    """ Test interpolation with PrecomputedSparseFunction which accepts
+        precomputed values for coefficients
+    """
+    shape = (200, 200)
+    points = [(.5, .5)] #, (.01, .8), (0.07, 0.84)]
+    origin = (0, 0)
+
+    grid = Grid(shape=shape, origin=origin)
+    r = 2  # Constant for linear interpolation
+    #  because we interpolate across 2 neighbouring points in each dimension
+    m = Function(name='m', grid=grid, space_order=0)
+
+    gridpoints, coefficients = precompute_linear_interpolation(points, grid, origin)
+
+    sf = PrecomputedSparseFunction(name='s', grid=grid, r=r, npoint=len(points),
+                                   gridpoints=gridpoints, coefficients=coefficients)
+    sf.data[:] = [sum(sin(x) for x in point) for point in points]
+    
+    eqn = sf.inject(m, sf)
+    op = Operator(eqn)
+    op()
+    interpolated_gridpoints = []
+    for point in gridpoints:
+        dim_ranges = []
+        for dim in range(grid.dim):
+            dim_ranges.append([x + point[dim] for x in range(r)])
+            
+        interpolated_gridpoints.extend(product(*dim_ranges))
+    expected_values = [(p, sum(sin(x*s) for x, s in zip(p, grid.spacing))) for p in interpolated_gridpoints]
+    val_map = ReducerMap()
+    val_map.update([[(str(k), v) for k, v in expected_values]])
+    val_map.reduce_all(op=lambda x, y: x+y)
+    from IPython import embed
+    embed()
+    for p, vs in expected_values:
+        v = val_map.reduce(str(p), op=lambda x, y: x+y)
+        assert(np.isclose(m.data[p], v, rtol=1e-5))
 
 
 @skipif_yask

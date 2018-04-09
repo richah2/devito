@@ -661,8 +661,8 @@ class ReducerMap(MultiDict):
         else:
             return reduce(op, self.getall(key))
 
-    def reduce_all(self):
+    def reduce_all(self, op=None):
         """
         Returns a dictionary with reduced/unique values for all keys.
         """
-        return {k: self.reduce(key=k) for k in self}
+        return {k: self.reduce(key=k, op=op) for k in self}
