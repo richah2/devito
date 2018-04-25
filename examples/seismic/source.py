@@ -1,4 +1,4 @@
-from scipy import signal
+#from scipy import signal
 from scipy.interpolate import CubicSpline
 from devito import Dimension
 from devito.function import SparseTimeFunction
@@ -59,10 +59,6 @@ class TimeAxis(object):
         self.step = step
         self.num = num
 
-    def __str__(self):
-        return "TimeAxis: start=%g, stop=%g, step=%g, num=%g" % \
-               (self.start, self.stop, self.step, self.num)
-
     def _rebuild(self):
         return TimeAxis(start=self.start, stop=self.stop, num=self.num)
 
@@ -71,7 +67,9 @@ class TimeAxis(object):
         return np.linspace(self.start, self.stop, self.num)
 
     def __getstate__(self):
-        return {'start':self.start, 'stop':self.stop, 'num':self.num}
+        state = self.__dict__.copy()
+        del state['step']
+        return state
 
     def __setstate__(self, state):
         self.__init__(start=state['start'], stop=state['stop'], num=state['num'])
@@ -130,6 +128,7 @@ class PointSource(SparseTimeFunction):
             assert num is not None
         else:
             assert num is None
+        assert np.isfinite(dt) 
 
         start, stop = self._time_range.start, self._time_range.stop
         dt0 = self._time_range.step
@@ -140,31 +139,33 @@ class PointSource(SparseTimeFunction):
         else:
             new_time_range = TimeAxis(start=start, stop=stop, step=dt)
 
-        npad = int(np.ceil(np.log2(self._time_range.num)))
-        for n in range(npad, 28):
-            if abs(2**n*dt0/np.ceil(2**n*dt0/dt) - dt)/dt < rtol:
-                npad = 2**n
-                break
+        #npad = int(np.ceil(np.log2(self._time_range.num)))
+        #for n in range(npad, 28):
+        #    if abs(2**n*dt0/np.ceil(2**n*dt0/dt) - dt)/dt < rtol:
+        #        npad = 2**n
+        #        break
 
         # Create resampled data.
         npoint = self.coordinates.shape[0]
         new_data = np.zeros((new_time_range.num, npoint))
-        scratch = np.zeros(npad)
-        scratch_time_range = TimeAxis(start=start, step=self._time_range.step, num=npad)
         for i in range(npoint):
-            scratch[0:self.data.shape[0]] = self.data[:, i]
-            resample_num = int(round((scratch_time_range.stop -
-                                      scratch_time_range.start)/dt))
-            approx_data, t = signal.resample(scratch, resample_num,
-                                             t=scratch_time_range.time_values)
-
-            spline = CubicSpline(t, approx_data, extrapolate=True)
+            spline = CubicSpline(self.time_values, self.data[:, i], extrapolate=True)
 
             new_data[:, i] = spline(new_time_range.time_values)
 
         # Return new object
-        return PointSource(self.name, self.grid, data=new_data, time_range=new_time_range,
-                           coordinates=self.coordinates.data)
+        return PointSource(self.name, self.grid, new_time_range,
+                           self.coordinates.shape[0], new_data,
+                           np.array(self.coordinates.data))
+
+    def __reduce_ex__(self, proto):
+        """ Pickling support."""
+        return type(self), self.__getnewargs__()
+
+    def __getnewargs__(self):
+        return (self.name, self.grid, self._time_range,
+                self.coordinates.shape[0], np.array(self.data),
+                np.array(self.coordinates.data))
 
 
 Receiver = PointSource
@@ -182,10 +183,10 @@ class WaveletSource(PointSource):
     :param time_values: Discretized values of time in ms
     """
 
-    def __new__(cls, *args, **kwargs):
+    def __new__(cls, name, grid, time_range, **kwargs):
         npoint = kwargs.get('npoint', 1)
         kwargs['npoint'] = npoint
-        obj = PointSource.__new__(cls, *args, **kwargs)
+        obj = PointSource.__new__(cls, name, grid, time_range, **kwargs)
 
         obj.f0 = kwargs.get('f0')
         for p in range(npoint):
@@ -221,6 +222,20 @@ class WaveletSource(PointSource):
         plt.tick_params()
         plt.show()
 
+    def __reduce_ex__(self, proto):
+        """ Pickling support."""
+        args = self.__getnewargs__()
+        state = self.__getstate__()
+        return type(self), args, state
+
+    def __getnewargs__(self):
+        return (self.name, self.grid, self._time_range)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['time_range'] = self._time_range
+        return state
+
 
 class RickerSource(WaveletSource):
     """
@@ -235,6 +250,18 @@ class RickerSource(WaveletSource):
     :param time: Discretized values of time in ms
     """
 
+    def __new__(cls, *args, **kwargs):
+        try:
+            obj = WaveletSource.__new__(cls, **kwargs)
+        except:
+            options = args[0]
+            obj = WaveletSource.__new__(cls, **options)
+        return obj
+
+    def __init__(self, *args, **kwargs):
+        if not self._cached():
+            super(RickerSource, self).__init__(*args, **kwargs)
+
     def wavelet(self, f0, t):
         """
         Defines a Ricker wavelet with a peak frequency f0 at time t.
@@ -244,6 +271,16 @@ class RickerSource(WaveletSource):
         """
         r = (np.pi * f0 * (t - 2./f0))
         return (1-2.*r**2)*np.exp(-r**2)
+
+    def __reduce_ex__(self, proto):
+        """ Pickling support."""
+        kwargs = self.__getstate__()
+        return type(self), (kwargs, )
+
+    def __getstate__(self):
+        state = {'name': self._name, 'grid': self.grid, 'f0': self.f0,
+                 'time_range': self._time_range}
+        return state
 
 
 class GaborSource(WaveletSource):

@@ -496,12 +496,14 @@ class Model(object):
             self.m.data = 1 / vp**2
 
     def __getstate__(self):
-        state = dict(self.__dict__)
-        state.pop('grid')
-        state.pop('damp')
-        state['m'] = np.array(self.m.data)
+        state = self.__dict__.copy()
+        del state['grid']
+        del state['damp']
+        state['m'] = np.array(self.m.data, dtype=self.dtype)
         state['spacing'] = self.spacing
         state['dtype'] = self.dtype
+        if state['epsilon']==1:
+            state['epsilon'] = None
         return state
 
     def __setstate__(self, state):

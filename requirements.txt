@@ -12,7 +12,7 @@ py-cpuinfo
 git+https://github.com/inducer/cgen
 git+https://github.com/inducer/codepy
 dask
-distributed
+git+https://github.com/dask/distributed
 scikit-image
 click
 codecov
