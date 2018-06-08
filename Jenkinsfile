@@ -13,7 +13,7 @@ pipeline {
             parallel {
                 // For each combination of parameters required, build and test
                 stage('Build and test gcc-4.9 container') {
-                     agent { dockerfile { label 'azure-linux-16core'
+                     agent { dockerfile { label 'azure-linux-4core'
                                           filename 'Dockerfile.jenkins'
                                           additionalBuildArgs "--build-arg gccvers=4.9" } }
                      environment { 
@@ -28,7 +28,7 @@ pipeline {
                      }
                 }
                 stage('Build and test gcc-4.9 OpenMP container') {
-                     agent { dockerfile { label 'azure-linux-16core' 
+                     agent { dockerfile { label 'azure-linux-4core' 
                                           filename 'Dockerfile.jenkins'
                                           additionalBuildArgs "--build-arg gccvers=4.9" } }
                      environment { 
@@ -46,7 +46,7 @@ pipeline {
                      }
                 }
                 stage('Build and test gcc-5 container') {
-                     agent { dockerfile { label 'azure-linux-16core' 
+                     agent { dockerfile { label 'azure-linux-4core' 
                                           filename 'Dockerfile.jenkins'
                                           additionalBuildArgs "--build-arg gccvers=5" } }
                      environment { 
@@ -63,7 +63,7 @@ pipeline {
                      }
                 }
                 stage('Build and test gcc-7 container') {
-                     agent { dockerfile { label 'azure-linux-16core'
+                     agent { dockerfile { label 'azure-linux-4core'
                                           filename 'Dockerfile.jenkins'
                                           additionalBuildArgs "--build-arg gccvers=7" } }
                      environment { 
@@ -122,7 +122,7 @@ def runPipTests() {
 }
 
 def runCondaTests() {
-    sh 'source activate devito ; py.test -n 16 --cov devito tests/'
+    sh 'source activate devito ; py.test -n 4 --cov devito tests/'
 }
 
 def runExamples () {
