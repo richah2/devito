@@ -303,6 +303,9 @@ class DerivedDimension(Dimension):
         """
         return
 
+    def __getnewargs__(self):
+        return (self.name, self.parent, )
+
 
 class SubDimension(DerivedDimension):
 
