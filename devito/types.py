@@ -212,11 +212,13 @@ class AbstractCachedSymbol(AbstractSymbol, Cached):
             newobj = sympy.Symbol.__new__(cls, *args, **options)
             newobj._cached_init()
         else:
-            name = kwargs.get('name')
-
-            # Create the new Function object and invoke __init__
-            newcls = cls._symbol_type(name)
-            newobj = sympy.Symbol.__new__(newcls, name, *args, **options)
+            try:
+                newcls = cls._symbol_type(*args)
+                newobj = sympy.Symbol.__new__(newcls, *args, **options)
+            except:
+                newcls = cls._symbol_type(kwargs.get('name'))
+                newobj = sympy.Symbol.__new__(newcls, kwargs.get('name'), **options)
+                args = (kwargs.get('name'), )
 
             # Initialization
             newobj.__init__(*args, **kwargs)
@@ -224,19 +226,6 @@ class AbstractCachedSymbol(AbstractSymbol, Cached):
             # Store new instance in symbol cache
             newcls._cache_put(newobj)
         return newobj
-
-    def __reduce__(self):
-        print("__reduce__ ", type(self), self.__getnewargs__(), self.__getstate__())
-        """ Pickling support."""
-        return type(self), self.__getnewargs__(), self.__getstate__()
-
-    def __getnewargs__(self):
-        return (self.name, )
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state['name'] = self.name
-        return state
 
     __hash__ = Cached.__hash__
 
