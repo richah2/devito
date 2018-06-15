@@ -14,7 +14,7 @@ from codepy.toolchain import GCCToolchain
 from devito.exceptions import CompilationError
 from devito.logger import log
 from devito.parameters import configuration
-from devito.tools import change_directory
+from devito.tools import as_tuple, change_directory, filter_ordered
 
 __all__ = ['jit_compile', 'load', 'make', 'GNUCompiler']
 
@@ -139,6 +139,18 @@ class Compiler(GCCToolchain):
 
     def __repr__(self):
         return "DevitoJITCompiler[%s]" % self.__class__.__name__
+
+    def add_include_dirs(self, dirs):
+        self.include_dirs = filter_ordered(self.include_dirs + list(as_tuple(dirs)))
+
+    def add_library_dirs(self, dirs):
+        self.library_dirs = filter_ordered(self.library_dirs + list(as_tuple(dirs)))
+
+    def add_libraries(self, libs):
+        self.libraries = filter_ordered(self.libraries + list(as_tuple(libs)))
+
+    def add_ldflags(self, flags):
+        self.ldflags = filter_ordered(self.ldflags + list(as_tuple(flags)))
 
 
 class GNUCompiler(Compiler):
